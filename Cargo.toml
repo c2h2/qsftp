@@ -1,0 +1,60 @@
+[package]
+name = "qsftp"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "qsftp-server"
+path = "src/bin/server_main.rs"
+
+[[bin]]
+name = "qsftp"
+path = "src/bin/sftp_main.rs"
+
+[[bin]]
+name = "qscp"
+path = "src/bin/scp_main.rs"
+
+[[bin]]
+name = "qsftp-test"
+path = "src/bin/test_client.rs"
+
+[[bin]]
+name = "qsftp-bench"
+path = "src/bin/bench.rs"
+
+[[bin]]
+name = "qsftp-test-pam"
+path = "src/bin/test_pam.rs"
+
+[[bin]]
+name = "qsftp-test-pam-auto"
+path = "src/bin/test_pam_auto.rs"
+
+[[bin]]
+name = "qsftp-test-key"
+path = "src/bin/test_key_auth.rs"
+
+[dependencies]
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rcgen = "0.13"
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+bytes = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rpassword = "5"
+ring = "0.17"
+pem = "3"
+rustls-pemfile = "2"
+pam = "0.8"
+ssh-key = { version = "0.6", features = ["crypto", "encryption", "std", "getrandom"] }
+rand = "0.8"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+signature = "2"
+rsa = "0.9"
+sha2 = "0.10"
