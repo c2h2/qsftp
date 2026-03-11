@@ -27,8 +27,9 @@ impl QsftpClient {
         let mut endpoint = Endpoint::client(bind_addr)?;
         endpoint.set_default_client_config(client_config);
 
+        tracing::debug!("Connecting to {} (SNI: {})...", server_addr, server_name);
         let connection = endpoint.connect(server_addr, server_name)?.await?;
-        tracing::info!("Connected to {}", server_addr);
+        tracing::debug!("QUIC connection established to {}", server_addr);
         Ok((connection, endpoint))
     }
 
@@ -38,6 +39,7 @@ impl QsftpClient {
         username: &str,
         password: &str,
     ) -> Result<Self> {
+        tracing::debug!("Trying password authentication for user '{}'", username);
         let (mut send, mut recv) = connection.open_bi().await?;
         let req = Request::Auth {
             username: username.to_string(),
@@ -71,10 +73,16 @@ impl QsftpClient {
         username: &str,
         private_key: &ssh_key::PrivateKey,
     ) -> Result<Self> {
+        tracing::debug!(
+            "Trying SSH key authentication for user '{}' (key type: {})",
+            username,
+            private_key.algorithm()
+        );
         let (mut send, mut recv) = connection.open_bi().await?;
 
         // Step 1: send username + public key
         let pub_key_str = crate::ssh_auth::public_key_openssh(private_key);
+        tracing::debug!("Sending public key to server");
         let req = Request::AuthPubKey {
             username: username.to_string(),
             pub_key: pub_key_str,
@@ -84,8 +92,10 @@ impl QsftpClient {
 
         match resp {
             Response::AuthChallenge { challenge } => {
+                tracing::debug!("Received auth challenge ({} bytes), signing...", challenge.len());
                 // Step 2: sign the challenge
                 let signature = crate::ssh_auth::sign_challenge(private_key, &challenge)?;
+                tracing::debug!("Challenge signed, sending signature");
                 let req = Request::AuthPubKeySign { signature };
                 write_msg(&mut send, &req).await?;
 

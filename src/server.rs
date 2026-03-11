@@ -10,21 +10,41 @@ use crate::auth;
 use crate::protocol::*;
 
 pub async fn run_server(
-    listen_addr: SocketAddr,
+    listen_addrs: &[SocketAddr],
     server_config: quinn::ServerConfig,
     no_auth: bool,
 ) -> Result<()> {
-    let endpoint = Endpoint::server(server_config, listen_addr)?;
-    info!("QSFTP server listening on {} (no_auth={})", listen_addr, no_auth);
+    let mut endpoints = Vec::new();
+    for addr in listen_addrs {
+        match Endpoint::server(server_config.clone(), *addr) {
+            Ok(ep) => {
+                info!("QSFTP server listening on {} (no_auth={})", addr, no_auth);
+                endpoints.push(ep);
+            }
+            Err(e) => {
+                warn!("Failed to bind {}: {}", addr, e);
+            }
+        }
+    }
 
-    while let Some(incoming) = endpoint.accept().await {
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(incoming, no_auth).await {
-                error!("Connection error: {}", e);
+    if endpoints.is_empty() {
+        anyhow::bail!("Failed to bind any listen address");
+    }
+
+    let mut set = tokio::task::JoinSet::new();
+    for endpoint in endpoints {
+        set.spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                tokio::spawn(async move {
+                    if let Err(e) = handle_connection(incoming, no_auth).await {
+                        error!("Connection error: {}", e);
+                    }
+                });
             }
         });
     }
 
+    set.join_next().await;
     Ok(())
 }
 

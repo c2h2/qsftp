@@ -45,15 +45,8 @@ can_build() {
         if command -v cross &>/dev/null; then
             return 0
         fi
-        # macOS->Linux or Linux->macOS without cross
-        case "${HOST_OS}" in
-            Darwin)
-                [[ "$target" == *"-linux-"* ]] && return 1  # need cross/Docker
-                ;;
-            Linux)
-                [[ "$target" == *"-apple-"* ]] && return 1  # can't cross-compile to macOS from Linux
-                ;;
-        esac
+        # No cross tool available — can't cross-compile
+        return 1
     fi
     return 0
 }

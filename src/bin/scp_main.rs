@@ -8,7 +8,7 @@ use qsftp::client::QsftpClient;
 use qsftp::protocol::*;
 
 #[derive(Parser)]
-#[command(name = "qscp", about = "SCP-style file copy over QUIC")]
+#[command(name = "qscp", version = env!("GIT_VERSION"), about = "SCP-style file copy over QUIC")]
 struct Args {
     /// Source: [user@host:]path
     source: String,
@@ -31,18 +31,23 @@ struct Args {
     /// Password (optional, prompts if not given)
     #[arg(long, env = "QSFTP_PASSWORD", hide = true)]
     password: Option<String>,
+
+    /// Verbose/debug output (like ssh -v)
+    #[arg(short = 'v', long)]
+    verbose: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Args::parse();
+
+    let default_level = if args.verbose { "debug" } else { "warn" };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level)),
         )
         .init();
-
-    let args = Args::parse();
 
     let src = parse_path_spec(&args.source);
     let dst = parse_path_spec(&args.dest);

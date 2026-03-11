@@ -7,7 +7,7 @@ use qsftp::client::QsftpClient;
 use qsftp::protocol::*;
 
 #[derive(Parser)]
-#[command(name = "qsftp", about = "Interactive SFTP client over QUIC")]
+#[command(name = "qsftp", version = env!("GIT_VERSION"), about = "Interactive SFTP client over QUIC")]
 struct Args {
     /// [user@]host
     destination: String,
@@ -23,25 +23,32 @@ struct Args {
     /// Password (optional, prompts if not given)
     #[arg(long, env = "QSFTP_PASSWORD", hide = true)]
     password: Option<String>,
+
+    /// Verbose/debug output (like ssh -v)
+    #[arg(short = 'v', long)]
+    verbose: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Args::parse();
+
+    let default_level = if args.verbose { "debug" } else { "warn" };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level)),
         )
         .init();
 
-    let args = Args::parse();
-
     let (username, host) = parse_destination(&args.destination)?;
 
+    tracing::debug!("Resolving host '{}' port {}", host, args.port);
     let addr = tokio::net::lookup_host(format!("{}:{}", host, args.port))
         .await?
         .next()
         .ok_or_else(|| anyhow::anyhow!("Could not resolve host: {}", host))?;
+    tracing::debug!("Resolved to {}", addr);
 
     let (connection, _endpoint) = QsftpClient::connect(addr, "localhost").await?;
 

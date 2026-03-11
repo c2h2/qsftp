@@ -4,11 +4,11 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "qsftp-server", about = "QSFTP server - SFTP over QUIC")]
+#[command(name = "qsftp-server", version = env!("GIT_VERSION"), about = "QSFTP server - SFTP over QUIC")]
 struct Args {
-    /// Listen address
-    #[arg(short, long, default_value = "0.0.0.0:1022")]
-    listen: SocketAddr,
+    /// Listen address (can be specified multiple times; defaults to [::]:1022 and 0.0.0.0:1022)
+    #[arg(short, long)]
+    listen: Vec<SocketAddr>,
 
     /// TLS certificate file (auto-generated if not provided)
     #[arg(long)]
@@ -21,18 +21,32 @@ struct Args {
     /// Disable authentication (for testing only)
     #[arg(long)]
     no_auth: bool,
+
+    /// Verbose/debug output
+    #[arg(short = 'v', long)]
+    verbose: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Args::parse();
+
+    let default_level = if args.verbose { "debug" } else { "info" };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level)),
         )
         .init();
 
-    let args = Args::parse();
+    let listen_addrs = if args.listen.is_empty() {
+        vec![
+            "[::]:1022".parse().unwrap(),
+            "0.0.0.0:1022".parse().unwrap(),
+        ]
+    } else {
+        args.listen
+    };
 
     let home = dirs_or_default();
     let cert_path = args
@@ -45,7 +59,7 @@ async fn main() -> Result<()> {
     let (certs, key) = qsftp::cert::load_or_generate_certs(&cert_path, &key_path)?;
     let server_config = qsftp::cert::build_server_config(certs, key)?;
 
-    qsftp::server::run_server(args.listen, server_config, args.no_auth).await
+    qsftp::server::run_server(&listen_addrs, server_config, args.no_auth).await
 }
 
 fn dirs_or_default() -> PathBuf {
