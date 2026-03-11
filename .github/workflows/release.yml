@@ -1,0 +1,118 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: x86_64
+            os: linux
+          - target: aarch64-unknown-linux-gnu
+            arch: aarch64
+            os: linux
+            use_cross: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Install PAM dev headers
+        if: "!matrix.use_cross"
+        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev libclang-dev
+
+      - name: Build
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      - name: Package
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          TARBALL="qsftp-${VERSION}-${{ matrix.arch }}-${{ matrix.os }}.tar.gz"
+          STAGE=$(mktemp -d)
+          for bin in qsftp-server qsftp qscp; do
+            cp "target/${{ matrix.target }}/release/${bin}" "${STAGE}/${bin}"
+          done
+          tar -czf "${TARBALL}" -C "${STAGE}" .
+          rm -rf "${STAGE}"
+          echo "TARBALL=${TARBALL}" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.arch }}-${{ matrix.os }}
+          path: ${{ env.TARBALL }}
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Build
+        run: cargo build --release --target aarch64-apple-darwin
+
+      - name: Package
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          TARBALL="qsftp-${VERSION}-aarch64-darwin.tar.gz"
+          STAGE=$(mktemp -d)
+          for bin in qsftp-server qsftp qscp; do
+            cp "target/aarch64-apple-darwin/release/${bin}" "${STAGE}/${bin}"
+          done
+          tar -czf "${TARBALL}" -C "${STAGE}" .
+          rm -rf "${STAGE}"
+          echo "TARBALL=${TARBALL}" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aarch64-darwin
+          path: ${{ env.TARBALL }}
+
+  release:
+    needs: [build-linux, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          # Collect all tarballs
+          FILES=$(find artifacts -name '*.tar.gz' -type f)
+          gh release create "${VERSION}" \
+            --title "qsftp ${VERSION}" \
+            --generate-notes \
+            ${FILES}
