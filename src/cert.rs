@@ -69,6 +69,10 @@ pub fn build_server_config(
     transport.stream_receive_window(4_194_304u32.into()); // 4 MiB
     transport.receive_window(16_777_216u32.into()); // 16 MiB
     transport.send_window(8_388_608); // 8 MiB
+    transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+    transport.max_idle_timeout(Some(
+        std::time::Duration::from_secs(300).try_into().expect("idle timeout"),
+    ));
 
     let quic_server_config = quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)?;
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_config));
@@ -142,6 +146,10 @@ pub fn build_client_config() -> Result<quinn::ClientConfig> {
     transport.stream_receive_window(4_194_304u32.into());
     transport.receive_window(16_777_216u32.into());
     transport.send_window(8_388_608);
+    transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+    transport.max_idle_timeout(Some(
+        std::time::Duration::from_secs(300).try_into().expect("idle timeout"),
+    ));
 
     let mut client_config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)?,

@@ -19,7 +19,12 @@ impl QsftpClient {
     ) -> Result<(quinn::Connection, Endpoint)> {
         let client_config = crate::cert::build_client_config()?;
 
-        let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
+        let bind_addr: SocketAddr = if server_addr.is_ipv6() {
+            "[::]:0".parse()?
+        } else {
+            "0.0.0.0:0".parse()?
+        };
+        let mut endpoint = Endpoint::client(bind_addr)?;
         endpoint.set_default_client_config(client_config);
 
         let connection = endpoint.connect(server_addr, server_name)?.await?;
@@ -130,8 +135,13 @@ impl QsftpClient {
         let resp: Response = read_msg(&mut recv).await?;
         match resp {
             Response::FileData { size } => {
-                // Receive data on uni stream
-                let mut uni_recv = self.connection.accept_uni().await?;
+                // Receive data on uni stream with timeout
+                let mut uni_recv = tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    self.connection.accept_uni(),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("Timed out waiting for server to start file transfer"))??;
 
                 if let Some(parent) = local_path.parent() {
                     let _ = tokio::fs::create_dir_all(parent).await;

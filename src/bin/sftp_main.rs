@@ -125,8 +125,8 @@ async fn run_interactive(client: &QsftpClient) -> Result<()> {
                 println!("  pwd              - Print remote working directory");
                 println!("  lpwd             - Print local working directory");
                 println!("  lcd <path>       - Change local directory");
-                println!("  get <remote> [local] - Download file");
-                println!("  put <local> [remote] - Upload file");
+                println!("  get [-r] <remote> [local] - Download file (-r for recursive)");
+                println!("  put [-r] <local> [remote] - Upload file (-r for recursive)");
                 println!("  mkdir <path>     - Create remote directory");
                 println!("  rm <path>        - Remove remote file/directory");
                 println!("  rename <old> <new> - Rename remote file");
@@ -202,13 +202,15 @@ async fn run_interactive(client: &QsftpClient) -> Result<()> {
                 }
             }
             "get" => {
-                if parts.len() < 2 {
-                    eprintln!("Usage: get <remote> [local]");
+                let recursive = parts.get(1) == Some(&"-r");
+                let arg_start = if recursive { 2 } else { 1 };
+                if parts.len() <= arg_start {
+                    eprintln!("Usage: get [-r] <remote> [local]");
                     continue;
                 }
-                let remote = parts[1];
-                let local_name = if parts.len() > 2 {
-                    parts[2]
+                let remote = parts[arg_start];
+                let local_name = if parts.len() > arg_start + 1 {
+                    parts[arg_start + 1]
                 } else {
                     Path::new(remote)
                         .file_name()
@@ -220,25 +222,34 @@ async fn run_interactive(client: &QsftpClient) -> Result<()> {
                 } else {
                     local_cwd.join(local_name)
                 };
-                eprintln!("Downloading {} -> {}", remote, local_path.display());
-                match client.download(remote, &local_path).await {
-                    Ok(_) => {}
-                    Err(e) => eprintln!("Error: {}", e),
+                if recursive {
+                    match download_recursive(client, remote, &local_path).await {
+                        Ok(_) => {}
+                        Err(e) => eprintln!("Error: {}", e),
+                    }
+                } else {
+                    eprintln!("Downloading {} -> {}", remote, local_path.display());
+                    match client.download(remote, &local_path).await {
+                        Ok(_) => {}
+                        Err(e) => eprintln!("Error: {}", e),
+                    }
                 }
             }
             "put" => {
-                if parts.len() < 2 {
-                    eprintln!("Usage: put <local> [remote]");
+                let recursive = parts.get(1) == Some(&"-r");
+                let arg_start = if recursive { 2 } else { 1 };
+                if parts.len() <= arg_start {
+                    eprintln!("Usage: put [-r] <local> [remote]");
                     continue;
                 }
-                let local_name = parts[1];
+                let local_name = parts[arg_start];
                 let local_path = if Path::new(local_name).is_absolute() {
                     PathBuf::from(local_name)
                 } else {
                     local_cwd.join(local_name)
                 };
-                let remote = if parts.len() > 2 {
-                    parts[2].to_string()
+                let remote = if parts.len() > arg_start + 1 {
+                    parts[arg_start + 1].to_string()
                 } else {
                     Path::new(local_name)
                         .file_name()
@@ -246,10 +257,17 @@ async fn run_interactive(client: &QsftpClient) -> Result<()> {
                         .unwrap_or(local_name)
                         .to_string()
                 };
-                eprintln!("Uploading {} -> {}", local_path.display(), remote);
-                match client.upload(&local_path, &remote).await {
-                    Ok(_) => {}
-                    Err(e) => eprintln!("Error: {}", e),
+                if recursive {
+                    match upload_recursive(client, &local_path, &remote).await {
+                        Ok(_) => {}
+                        Err(e) => eprintln!("Error: {}", e),
+                    }
+                } else {
+                    eprintln!("Uploading {} -> {}", local_path.display(), remote);
+                    match client.upload(&local_path, &remote).await {
+                        Ok(_) => {}
+                        Err(e) => eprintln!("Error: {}", e),
+                    }
                 }
             }
             "mkdir" => {
@@ -348,6 +366,65 @@ async fn run_interactive(client: &QsftpClient) -> Result<()> {
             _ => {
                 eprintln!("Unknown command: {}. Type 'help' for available commands.", cmd);
             }
+        }
+    }
+
+    Ok(())
+}
+
+async fn download_recursive(client: &QsftpClient, remote_dir: &str, local_dir: &Path) -> Result<()> {
+    tokio::fs::create_dir_all(local_dir).await?;
+
+    let resp = client
+        .command(&Request::Ls {
+            path: remote_dir.to_string(),
+        })
+        .await?;
+
+    match resp {
+        Response::DirListing { entries } => {
+            for entry in entries {
+                let remote_path = format!("{}/{}", remote_dir, entry.name);
+                let local_path = local_dir.join(&entry.name);
+
+                if entry.is_dir {
+                    Box::pin(download_recursive(client, &remote_path, &local_path)).await?;
+                } else {
+                    eprintln!("Downloading {}", remote_path);
+                    client.download(&remote_path, &local_path).await?;
+                }
+            }
+        }
+        Response::Error { message } => {
+            anyhow::bail!("Failed to list {}: {}", remote_dir, message);
+        }
+        _ => {
+            anyhow::bail!("Unexpected response");
+        }
+    }
+
+    Ok(())
+}
+
+async fn upload_recursive(client: &QsftpClient, local_dir: &Path, remote_dir: &str) -> Result<()> {
+    let _ = client
+        .command(&Request::Mkdir {
+            path: remote_dir.to_string(),
+        })
+        .await?;
+
+    let mut dir = tokio::fs::read_dir(local_dir).await?;
+    while let Some(entry) = dir.next_entry().await? {
+        let meta = entry.metadata().await?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        let remote_path = format!("{}/{}", remote_dir, name);
+        let local_path = entry.path();
+
+        if meta.is_dir() {
+            Box::pin(upload_recursive(client, &local_path, &remote_path)).await?;
+        } else {
+            eprintln!("Uploading {}", local_path.display());
+            client.upload(&local_path, &remote_path).await?;
         }
     }
 
