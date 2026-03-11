@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use tokio::net;
 
 use qsftp::client::QsftpClient;
 use qsftp::protocol::*;
@@ -49,7 +50,7 @@ async fn main() -> Result<()> {
     match (&src, &dst) {
         (PathSpec::Remote { user, host, path }, PathSpec::Local { path: local_path }) => {
             // Download
-            let addr: SocketAddr = format!("{}:{}", host, args.port).parse()?;
+            let addr = resolve_host(host, args.port).await?;
             let client = connect_and_auth(addr, user, host, args.identity.as_deref(), &args.password).await?;
 
             let local = PathBuf::from(local_path);
@@ -62,7 +63,7 @@ async fn main() -> Result<()> {
         }
         (PathSpec::Local { path: local_path }, PathSpec::Remote { user, host, path }) => {
             // Upload
-            let addr: SocketAddr = format!("{}:{}", host, args.port).parse()?;
+            let addr = resolve_host(host, args.port).await?;
             let client = connect_and_auth(addr, user, host, args.identity.as_deref(), &args.password).await?;
 
             let local = PathBuf::from(local_path);
@@ -109,6 +110,13 @@ fn parse_path_spec(s: &str) -> PathSpec {
     PathSpec::Local {
         path: s.to_string(),
     }
+}
+
+async fn resolve_host(host: &str, port: u16) -> Result<SocketAddr> {
+    net::lookup_host(format!("{}:{}", host, port))
+        .await?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Could not resolve host: {}", host))
 }
 
 async fn download_recursive(client: &QsftpClient, remote_dir: &str, local_dir: &Path) -> Result<()> {

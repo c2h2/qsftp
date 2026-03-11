@@ -1,6 +1,5 @@
 use anyhow::Result;
 use clap::Parser;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -39,7 +38,10 @@ async fn main() -> Result<()> {
 
     let (username, host) = parse_destination(&args.destination)?;
 
-    let addr: SocketAddr = format!("{}:{}", host, args.port).parse()?;
+    let addr = tokio::net::lookup_host(format!("{}:{}", host, args.port))
+        .await?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Could not resolve host: {}", host))?;
 
     let (connection, _endpoint) = QsftpClient::connect(addr, "localhost").await?;
 
