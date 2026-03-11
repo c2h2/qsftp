@@ -115,4 +115,5 @@ jobs:
           gh release create "${VERSION}" \
             --title "qsftp ${VERSION}" \
             --generate-notes \
+            install.sh \
             ${FILES}
