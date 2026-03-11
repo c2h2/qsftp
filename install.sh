@@ -164,7 +164,7 @@ Documentation=https://github.com/${REPO}
 
 [Service]
 Type=simple
-ExecStart=${INSTALL_DIR}/qsftp-server --listen 0.0.0.0:${DEFAULT_PORT}
+ExecStart=${INSTALL_DIR}/qsftp-server --listen [::]:${DEFAULT_PORT} --listen 0.0.0.0:${DEFAULT_PORT}
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536
