@@ -9,7 +9,7 @@ pub struct UserInfo {
 }
 
 /// Authenticate using PAM (same as sshd), then get user info from /etc/passwd.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "pam-auth"))]
 pub fn authenticate_pam(username: &str, password: &str) -> Result<UserInfo> {
     let mut client = pam::Client::with_password("qsftp")
         .map_err(|e| anyhow::anyhow!("PAM init failed: {}", e))?;
@@ -27,7 +27,7 @@ pub fn authenticate_pam(username: &str, password: &str) -> Result<UserInfo> {
 }
 
 /// Shadow-based authentication fallback (needs root)
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "pam-auth"))]
 pub fn authenticate_shadow(username: &str, password: &str) -> Result<UserInfo> {
     // Try PAM first
     match authenticate_pam(username, password) {
@@ -38,6 +38,16 @@ pub fn authenticate_shadow(username: &str, password: &str) -> Result<UserInfo> {
     }
 
     // Fallback: python shadow check (requires root)
+    if verify_unix_password(username, password)? {
+        get_user_info(username)
+    } else {
+        anyhow::bail!("authentication failed for user {}", username)
+    }
+}
+
+/// Shadow-based authentication (no PAM, needs root)
+#[cfg(all(target_os = "linux", not(feature = "pam-auth")))]
+pub fn authenticate_shadow(username: &str, password: &str) -> Result<UserInfo> {
     if verify_unix_password(username, password)? {
         get_user_info(username)
     } else {

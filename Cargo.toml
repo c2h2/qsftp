@@ -35,6 +35,10 @@ path = "src/bin/test_pam_auto.rs"
 name = "qsftp-test-key"
 path = "src/bin/test_key_auth.rs"
 
+[features]
+default = []
+pam-auth = ["pam"]
+
 [dependencies]
 quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
@@ -59,4 +63,4 @@ rsa = "0.9"
 sha2 = "0.10"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-pam = "0.8"
+pam = { version = "0.8", optional = true }
