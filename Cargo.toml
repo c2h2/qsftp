@@ -51,10 +51,12 @@ rpassword = "5"
 ring = "0.17"
 pem = "3"
 rustls-pemfile = "2"
-pam = "0.8"
 ssh-key = { version = "0.6", features = ["crypto", "encryption", "std", "getrandom"] }
 rand = "0.8"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 signature = "2"
 rsa = "0.9"
 sha2 = "0.10"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+pam = "0.8"

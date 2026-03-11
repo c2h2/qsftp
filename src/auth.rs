@@ -9,6 +9,7 @@ pub struct UserInfo {
 }
 
 /// Authenticate using PAM (same as sshd), then get user info from /etc/passwd.
+#[cfg(target_os = "linux")]
 pub fn authenticate_pam(username: &str, password: &str) -> Result<UserInfo> {
     let mut client = pam::Client::with_password("qsftp")
         .map_err(|e| anyhow::anyhow!("PAM init failed: {}", e))?;
@@ -26,6 +27,7 @@ pub fn authenticate_pam(username: &str, password: &str) -> Result<UserInfo> {
 }
 
 /// Shadow-based authentication fallback (needs root)
+#[cfg(target_os = "linux")]
 pub fn authenticate_shadow(username: &str, password: &str) -> Result<UserInfo> {
     // Try PAM first
     match authenticate_pam(username, password) {
@@ -41,6 +43,11 @@ pub fn authenticate_shadow(username: &str, password: &str) -> Result<UserInfo> {
     } else {
         anyhow::bail!("authentication failed for user {}", username)
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn authenticate_shadow(username: &str, _password: &str) -> Result<UserInfo> {
+    anyhow::bail!("password authentication is not supported on this platform (user '{}')", username)
 }
 
 pub fn get_user_info_public(username: &str) -> Result<UserInfo> {
@@ -79,6 +86,7 @@ fn get_user_info(username: &str) -> Result<UserInfo> {
     })
 }
 
+#[cfg(target_os = "linux")]
 fn verify_unix_password(username: &str, password: &str) -> Result<bool> {
     use std::process::Command;
 
