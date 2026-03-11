@@ -126,6 +126,18 @@ main() {
         ok "qsftp-server is available in PATH"
     else
         warn "${INSTALL_DIR} may not be in your PATH"
+        # Add to PATH via /etc/profile.d if possible
+        PROFILE_SCRIPT="/etc/profile.d/qsftp.sh"
+        if [ -d "/etc/profile.d" ]; then
+            EXPORT_LINE="export PATH=\"${INSTALL_DIR}:\$PATH\""
+            if [ -w "/etc/profile.d" ]; then
+                echo "$EXPORT_LINE" > "$PROFILE_SCRIPT"
+            else
+                echo "$EXPORT_LINE" | sudo tee "$PROFILE_SCRIPT" > /dev/null
+            fi
+            ok "Added ${INSTALL_DIR} to PATH in ${PROFILE_SCRIPT}"
+            info "Run 'source ${PROFILE_SCRIPT}' or start a new shell"
+        fi
     fi
 
     # Install systemd service
