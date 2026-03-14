@@ -159,8 +159,8 @@ main() {
 
     if [ "$SKIP_SERVICE" != "1" ] && [ "$OS" = "linux" ] && command -v systemctl > /dev/null 2>&1; then
         printf '  Service:\n'
-        printf '    sudo systemctl start qsftp-server\n'
-        printf '    sudo systemctl enable qsftp-server   # start on boot\n'
+        printf '    sudo systemctl status qsftp-server   # check status\n'
+        printf '    sudo systemctl restart qsftp-server  # restart\n'
         printf '    sudo journalctl -u qsftp-server -f   # view logs\n\n'
     fi
 }
@@ -207,12 +207,15 @@ WantedBy=multi-user.target
     # Reload systemd
     if [ -w "/etc/systemd/system" ]; then
         systemctl daemon-reload
+        systemctl enable qsftp-server
+        systemctl restart qsftp-server
     else
         sudo systemctl daemon-reload
+        sudo systemctl enable qsftp-server
+        sudo systemctl restart qsftp-server
     fi
     ok "Systemd daemon reloaded"
-
-    info "Run 'sudo systemctl start qsftp-server' to start"
+    ok "Service enabled and started"
 }
 
 main "$@"
