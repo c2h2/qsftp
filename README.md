@@ -18,24 +18,23 @@ Test machine: Apple M-series, release build (`cargo build --release`).
 
 **Compressible data** (text-like, high redundancy):
 
-| Mode             | Upload       | Download     | Wire size | Speedup          |
-|------------------|-------------|-------------|-----------|------------------|
-| Uncompressed     | 241 MiB/s   | 366 MiB/s   | 100%      | baseline         |
-| zstd compressed  | 3,454 MiB/s | 3,423 MiB/s | ~0%       | 14x up / 9x dl   |
+| Mode             | Upload       | Download     | Wire size | Speedup         |
+|------------------|-------------|-------------|-----------|-----------------|
+| Uncompressed     | 242 MiB/s   | 374 MiB/s   | 100%      | baseline        |
+| zstd compressed  | 3,510 MiB/s | 3,070 MiB/s | ~0%       | 14x up / 8x dl  |
 
-**Incompressible data** (binary/random):
+**Incompressible data** (per-byte random, truly uncompressible):
 
-| Mode             | Upload       | Download     | Wire size | Speedup          |
-|------------------|-------------|-------------|-----------|------------------|
-| Uncompressed     | 240 MiB/s   | 366 MiB/s   | 100%      | baseline         |
-| zstd compressed  | 3,385 MiB/s | 3,424 MiB/s | ~102%*    | 14x up / 9x dl   |
+| Mode             | Upload       | Download     | Wire size | Speedup         |
+|------------------|-------------|-------------|-----------|-----------------|
+| Uncompressed     | 242 MiB/s   | 376 MiB/s   | 100%      | baseline        |
+| zstd compressed  | 241 MiB/s   | 365 MiB/s   | ~100%     | 1.0x (no gain)  |
 
-\* zstd adds a small header to incompressible data (~0.1% overhead), but the CPU saves
-more than enough time to still be faster end-to-end on loopback.
-
-**Key insight:** even for incompressible data, compression is faster on loopback because
-less data crosses the QUIC stack — fewer packets, less encryption overhead, less kernel
-work. On a real network the benefit is even larger since wire bandwidth is the bottleneck.
+**Key insight:** compression only helps when data is actually compressible. For random/
+encrypted data the wire size stays the same and you pay a small CPU overhead (~1%
+slowdown). For compressible data (logs, text, source code, JSON) the speedup is dramatic
+— up to 14x — because less data crosses the QUIC/TLS/UDP stack. On a real network with
+limited bandwidth the benefit is even larger.
 
 ### Transfer settings
 

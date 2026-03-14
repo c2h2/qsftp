@@ -97,39 +97,51 @@ async fn main() -> Result<()> {
     let (connection, _endpoint) = QsftpClient::connect(addr, "localhost").await?;
     let client = QsftpClient::authenticate(connection, "test", "test").await?;
 
-    // Two test files: compressible (text-like) and incompressible (binary)
-    let tests: &[(&str, Box<dyn Fn(usize) -> u8>)] = &[
-        ("compressible (text-like)", Box::new(|i| (i % 64) as u8)),
-        ("incompressible (random-ish)", Box::new(|i| {
-            // LCG to approximate random bytes
-            let x = (i as u64).wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (x >> 33) as u8
-        })),
+    let test_file = PathBuf::from("/tmp/qsftp_bench_file.bin");
+    let dl_file = PathBuf::from("/tmp/qsftp_bench_download.bin");
+    let remote = "/tmp/qsftp_bench_remote.bin";
+
+    // Two test files: compressible (text-like) and truly incompressible (per-byte LCG)
+    struct TestCase { label: &'static str, compressible: bool }
+    let tests = [
+        TestCase { label: "compressible (text-like)", compressible: true },
+        TestCase { label: "incompressible (random)", compressible: false },
     ];
 
-    for (file_label, byte_fn) in tests {
+    for tc in &tests {
         println!("\n{}", "=".repeat(60));
-        println!("File type: {}", file_label);
+        println!("File type: {}", tc.label);
         println!("{}", "=".repeat(60));
-
-        let test_file = PathBuf::from("/tmp/qsftp_bench_file.bin");
-        let dl_file = PathBuf::from("/tmp/qsftp_bench_download.bin");
-        let remote = "/tmp/qsftp_bench_remote.bin";
 
         // Generate test file
         print!("  Generating {} MiB test file... ", size_mb);
         {
             use tokio::io::AsyncWriteExt;
             let mut f = tokio::fs::File::create(&test_file).await?;
-            for i in 0..size_mb {
-                let byte = byte_fn(i);
-                f.write_all(&vec![byte; 1024 * 1024]).await?;
+            if tc.compressible {
+                // Highly compressible: each 1 MiB is a single repeated byte
+                for i in 0..size_mb {
+                    f.write_all(&vec![(i & 0xFF) as u8; 1024 * 1024]).await?;
+                }
+            } else {
+                // Truly incompressible: per-byte LCG — each byte is different
+                let chunk_size = 1024 * 1024;
+                let mut state: u64 = 0xdeadbeefcafebabe;
+                for _ in 0..size_mb {
+                    let mut chunk = vec![0u8; chunk_size];
+                    for b in chunk.iter_mut() {
+                        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                        *b = (state >> 33) as u8;
+                    }
+                    f.write_all(&chunk).await?;
+                }
             }
             f.flush().await?;
         }
         println!("done");
 
         let source_hash = sha256_file(&test_file).await?;
+        let _ = tc.compressible; // suppress unused warning
         println!("  SHA-256: {}", source_hash);
 
         let mut results = Vec::new();
