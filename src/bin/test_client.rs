@@ -68,7 +68,7 @@ async fn main() -> Result<()> {
     let local_upload = PathBuf::from("/tmp/qsftp_test_upload.bin");
     tokio::fs::write(&local_upload, &test_data).await?;
     let remote_path = format!("{}/test_file.bin", test_dir);
-    match client.upload(&local_upload, &remote_path).await {
+    match client.upload(&local_upload, &remote_path, false).await {
         Ok(n) => println!("[OK] Uploaded {} bytes", n),
         Err(e) => println!("[FAIL] Upload failed: {}", e),
     }
@@ -87,7 +87,7 @@ async fn main() -> Result<()> {
     // Test: download the file back
     println!("\n--- Test: download ---");
     let local_download = PathBuf::from("/tmp/qsftp_test_download.bin");
-    match client.download(&remote_path, &local_download).await {
+    match client.download(&remote_path, &local_download, false).await {
         Ok(n) => {
             println!("[OK] Downloaded {} bytes", n);
             let downloaded = tokio::fs::read(&local_download).await?;
@@ -145,7 +145,7 @@ async fn main() -> Result<()> {
 
     let start = std::time::Instant::now();
     let remote_large = format!("{}/large_file.bin", test_dir);
-    match client.upload(&large_local, &remote_large).await {
+    match client.upload(&large_local, &remote_large, false).await {
         Ok(n) => {
             let elapsed = start.elapsed().as_secs_f64();
             let speed = n as f64 / elapsed / 1024.0 / 1024.0;
@@ -156,7 +156,7 @@ async fn main() -> Result<()> {
 
     let start = std::time::Instant::now();
     let large_download = PathBuf::from("/tmp/qsftp_test_large_dl.bin");
-    match client.download(&remote_large, &large_download).await {
+    match client.download(&remote_large, &large_download, false).await {
         Ok(n) => {
             let elapsed = start.elapsed().as_secs_f64();
             let speed = n as f64 / elapsed / 1024.0 / 1024.0;

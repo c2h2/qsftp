@@ -133,17 +133,18 @@ impl QsftpClient {
         Ok(resp)
     }
 
-    pub async fn download(&self, remote_path: &str, local_path: &Path) -> Result<u64> {
+    pub async fn download(&self, remote_path: &str, local_path: &Path, compress: bool) -> Result<u64> {
         let (mut send, mut recv) = self.connection.open_bi().await?;
         let req = Request::Get {
             path: remote_path.to_string(),
+            compress,
         };
         write_msg(&mut send, &req).await?;
         send.finish()?;
 
         let resp: Response = read_msg(&mut recv).await?;
         match resp {
-            Response::FileData { size } => {
+            Response::FileData { size, compress: use_compress } => {
                 // Receive data on uni stream with timeout
                 let uni_recv = tokio::time::timeout(
                     std::time::Duration::from_secs(30),
@@ -160,7 +161,13 @@ impl QsftpClient {
                 let file = tokio::fs::File::create(local_path).await?;
                 let start = std::time::Instant::now();
 
-                let (received, _file) = crate::protocol::pipe_chunks(uni_recv, file, chunk, 8).await?;
+                let received = if use_compress {
+                    let (n, _file) = crate::protocol::pipe_chunks_decompress(uni_recv, file, 8).await?;
+                    n
+                } else {
+                    let (n, _file) = crate::protocol::pipe_chunks(uni_recv, file, chunk, 8).await?;
+                    n
+                };
 
                 let elapsed = start.elapsed().as_secs_f64();
                 let speed = received as f64 / elapsed / 1024.0 / 1024.0;
@@ -182,7 +189,7 @@ impl QsftpClient {
         }
     }
 
-    pub async fn upload(&self, local_path: &Path, remote_path: &str) -> Result<u64> {
+    pub async fn upload(&self, local_path: &Path, remote_path: &str, compress: bool) -> Result<u64> {
         let meta = tokio::fs::metadata(local_path).await?;
         let size = meta.len();
         let mode = {
@@ -195,6 +202,7 @@ impl QsftpClient {
             path: remote_path.to_string(),
             size,
             mode,
+            compress,
         };
         write_msg(&mut send, &req).await?;
 
@@ -208,7 +216,12 @@ impl QsftpClient {
                 let file = tokio::fs::File::open(local_path).await?;
                 let start = std::time::Instant::now();
 
-                let (sent, mut uni_send) = crate::protocol::pipe_chunks(file, uni_send, chunk, 8).await?;
+                let (sent, mut uni_send) = if compress {
+                    let (raw, _comp, w) = crate::protocol::pipe_chunks_compress(file, uni_send, chunk, 8).await?;
+                    (raw, w)
+                } else {
+                    crate::protocol::pipe_chunks(file, uni_send, chunk, 8).await?
+                };
                 uni_send.finish()?;
 
                 // Wait for server confirmation

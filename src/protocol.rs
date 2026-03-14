@@ -38,8 +38,8 @@ pub enum Request {
     Rm { path: String },
     Rename { old_path: String, new_path: String },
     Chmod { path: String, mode: u32 },
-    Get { path: String },
-    Put { path: String, size: u64, mode: u32 },
+    Get { path: String, compress: bool },
+    Put { path: String, size: u64, mode: u32, compress: bool },
     Pwd,
     Cd { path: String },
 }
@@ -54,7 +54,7 @@ pub enum Response {
     DirListing { entries: Vec<DirEntry> },
     FileStat { stat: FileStat },
     Pwd { path: String },
-    FileData { size: u64 },
+    FileData { size: u64, compress: bool },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -100,6 +100,9 @@ pub async fn read_msg<R: AsyncReadExt + Unpin, T: for<'de> Deserialize<'de>>(
     reader.read_exact(&mut buf).await?;
     Ok(bincode::deserialize(&buf)?)
 }
+
+/// zstd compression level: 3 is the default sweet spot (fast, decent ratio).
+pub const ZSTD_LEVEL: i32 = 3;
 
 /// Pipelined chunk transfer: reader and writer run concurrently with a
 /// bounded channel between them so disk I/O and network I/O overlap.
@@ -156,4 +159,123 @@ where
     let (read_res, write_res) = tokio::join!(reader_task, writer_task);
     let writer = write_res??;
     Ok((read_res??, writer))
+}
+
+/// Like `pipe_chunks` but compresses each chunk with zstd before writing.
+/// Returns `(uncompressed_bytes, compressed_bytes, writer)`.
+pub async fn pipe_chunks_compress<R, W>(
+    mut reader: R,
+    mut writer: W,
+    chunk_size: usize,
+    queue_depth: usize,
+) -> Result<(u64, u64, W)>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(queue_depth);
+
+    let reader_task = tokio::spawn(async move {
+        let mut raw_total = 0u64;
+        loop {
+            let mut buf = vec![0u8; chunk_size];
+            let mut filled = 0usize;
+            while filled < chunk_size {
+                match reader.read(&mut buf[filled..]).await {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(e) => return Err(anyhow::anyhow!(e)),
+                }
+            }
+            if filled == 0 {
+                break;
+            }
+            buf.truncate(filled);
+            raw_total += filled as u64;
+            // Compress on the blocking thread pool to avoid stalling the async runtime
+            let compressed = tokio::task::spawn_blocking(move || {
+                zstd::encode_all(buf.as_slice(), ZSTD_LEVEL)
+            })
+            .await??;
+            // Frame: 4-byte little-endian length prefix + compressed data
+            let mut framed = Vec::with_capacity(4 + compressed.len());
+            framed.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+            framed.extend_from_slice(&compressed);
+            if tx.send(bytes::Bytes::from(framed)).await.is_err() {
+                break;
+            }
+        }
+        Ok::<u64, anyhow::Error>(raw_total)
+    });
+
+    let writer_task = tokio::spawn(async move {
+        let mut compressed_total = 0u64;
+        while let Some(chunk) = rx.recv().await {
+            compressed_total += chunk.len() as u64;
+            writer.write_all(&chunk).await?;
+        }
+        writer.flush().await?;
+        Ok::<(u64, W), anyhow::Error>((compressed_total, writer))
+    });
+
+    let (read_res, write_res) = tokio::join!(reader_task, writer_task);
+    let (compressed_total, writer) = write_res??;
+    Ok((read_res??, compressed_total, writer))
+}
+
+/// Receives a zstd-compressed stream (framed with 4-byte LE length prefixes)
+/// and writes decompressed data to writer.
+/// Returns `(uncompressed_bytes, writer)`.
+pub async fn pipe_chunks_decompress<R, W>(
+    mut reader: R,
+    mut writer: W,
+    queue_depth: usize,
+) -> Result<(u64, W)>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(queue_depth);
+
+    let reader_task = tokio::spawn(async move {
+        loop {
+            // Read 4-byte frame length
+            let mut len_buf = [0u8; 4];
+            match reader.read_exact(&mut len_buf).await {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(anyhow::anyhow!(e)),
+            }
+            let frame_len = u32::from_le_bytes(len_buf) as usize;
+            if frame_len == 0 {
+                break;
+            }
+            let mut compressed = vec![0u8; frame_len];
+            reader.read_exact(&mut compressed).await?;
+            // Decompress on the blocking thread pool
+            let decompressed = tokio::task::spawn_blocking(move || {
+                zstd::decode_all(compressed.as_slice())
+            })
+            .await??;
+            if tx.send(bytes::Bytes::from(decompressed)).await.is_err() {
+                break;
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    let writer_task = tokio::spawn(async move {
+        let mut total = 0u64;
+        while let Some(chunk) = rx.recv().await {
+            total += chunk.len() as u64;
+            writer.write_all(&chunk).await?;
+        }
+        writer.flush().await?;
+        Ok::<(u64, W), anyhow::Error>((total, writer))
+    });
+
+    let (read_res, write_res) = tokio::join!(reader_task, writer_task);
+    read_res??;
+    let (total, writer) = write_res??;
+    Ok((total, writer))
 }

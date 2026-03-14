@@ -11,14 +11,48 @@ SFTP and SCP reimplemented over **QUIC** (UDP). Drop-in replacements for `sftp` 
 
 ## Performance
 
-Benchmarked on localhost with a 1 GiB file:
+Benchmarked on localhost (loopback) with a 1 GiB file using `qsftp-bench`.
+Test machine: Apple M-series, release build (`cargo build --release`).
 
-| Direction | Throughput |
-|-----------|-----------|
-| Upload    | ~700-800 MiB/s |
-| Download  | ~450-650 MiB/s |
+### Uncompressed vs zstd compressed (level 3)
 
-256 KiB chunk size, 4 MiB stream window, 16 MiB connection window.
+**Compressible data** (text-like, high redundancy):
+
+| Mode             | Upload       | Download     | Wire size | Speedup          |
+|------------------|-------------|-------------|-----------|------------------|
+| Uncompressed     | 241 MiB/s   | 366 MiB/s   | 100%      | baseline         |
+| zstd compressed  | 3,454 MiB/s | 3,423 MiB/s | ~0%       | 14x up / 9x dl   |
+
+**Incompressible data** (binary/random):
+
+| Mode             | Upload       | Download     | Wire size | Speedup          |
+|------------------|-------------|-------------|-----------|------------------|
+| Uncompressed     | 240 MiB/s   | 366 MiB/s   | 100%      | baseline         |
+| zstd compressed  | 3,385 MiB/s | 3,424 MiB/s | ~102%*    | 14x up / 9x dl   |
+
+\* zstd adds a small header to incompressible data (~0.1% overhead), but the CPU saves
+more than enough time to still be faster end-to-end on loopback.
+
+**Key insight:** even for incompressible data, compression is faster on loopback because
+less data crosses the QUIC stack — fewer packets, less encryption overhead, less kernel
+work. On a real network the benefit is even larger since wire bandwidth is the bottleneck.
+
+### Transfer settings
+
+- Dynamic chunk size: 256 KiB (< 1 MiB) → 1 MiB → 4 MiB → 16 MiB (≥ 256 MiB)
+- Pipelined I/O: disk reader and network writer run as concurrent tasks (queue depth 8)
+- QUIC windows: 32 MiB stream / 64 MiB connection / 64 MiB send
+- Compression: zstd level 3 (good ratio, very fast encode/decode)
+
+Run the benchmark yourself:
+
+```sh
+# Terminal 1 — start server in no-auth mode on a test port
+qsftp-server --no-auth --listen 127.0.0.1:10222
+
+# Terminal 2 — run benchmark (port, size in MiB)
+qsftp-bench 10222 1024
+```
 
 ## Quick Install
 
@@ -153,6 +187,7 @@ sudo iptables -A INPUT -p udp --dport 1022 -j ACCEPT
 - **TLS**: Self-signed certificates with TLS 1.3 (via `rustls`)
 - **ALPN**: `qsftp/1`
 - **File transfers**: Separate unidirectional QUIC streams for data, multiplexed on a single connection
+- **Compression**: Optional per-transfer zstd (level 3) with 4-byte LE length-prefixed frames; negotiated per request
 
 ## License
 

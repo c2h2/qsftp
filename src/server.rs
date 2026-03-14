@@ -418,7 +418,7 @@ async fn handle_command(
                 .await?;
             }
         }
-        Request::Get { path } => {
+        Request::Get { path, compress } => {
             let resolved = {
                 let sess = session.lock().await;
                 resolve_path(&sess.cwd, &path)
@@ -427,14 +427,19 @@ async fn handle_command(
                 Ok(meta) => {
                     let size = meta.len();
                     let chunk = crate::protocol::dynamic_chunk_size(size);
-                    write_msg(&mut send, &Response::FileData { size }).await?;
+                    write_msg(&mut send, &Response::FileData { size, compress }).await?;
 
                     // Send file data on a new uni stream
                     let uni_send = connection.open_uni().await?;
-
                     let file = tokio::fs::File::open(&resolved).await?;
-                    let (_, mut uni_send) = crate::protocol::pipe_chunks(file, uni_send, chunk, 8).await?;
-                    uni_send.finish()?;
+
+                    if compress {
+                        let (_, _, mut uni_send) = crate::protocol::pipe_chunks_compress(file, uni_send, chunk, 8).await?;
+                        uni_send.finish()?;
+                    } else {
+                        let (_, mut uni_send) = crate::protocol::pipe_chunks(file, uni_send, chunk, 8).await?;
+                        uni_send.finish()?;
+                    }
                 }
                 Err(e) => {
                     write_msg(
@@ -447,7 +452,7 @@ async fn handle_command(
                 }
             }
         }
-        Request::Put { path, size, mode } => {
+        Request::Put { path, size, mode, compress } => {
             let resolved = {
                 let sess = session.lock().await;
                 resolve_path(&sess.cwd, &path)
@@ -464,8 +469,12 @@ async fn handle_command(
             // Receive file data on a uni stream
             let uni_recv = connection.accept_uni().await?;
             let file = tokio::fs::File::create(&resolved).await?;
-            crate::protocol::pipe_chunks(uni_recv, file, chunk, 8).await?;
-            // file flushed and dropped inside pipe_chunks
+
+            if compress {
+                crate::protocol::pipe_chunks_decompress(uni_recv, file, 8).await?;
+            } else {
+                crate::protocol::pipe_chunks(uni_recv, file, chunk, 8).await?;
+            }
 
             // Set permissions
             set_permissions(&resolved, mode).await?;
