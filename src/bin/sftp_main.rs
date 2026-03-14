@@ -343,7 +343,7 @@ async fn run_interactive(client: &QsftpClient) -> Result<()> {
                     }
                 } else {
                     eprintln!("Downloading {} -> {}", remote, local_path.display());
-                    match client.download(remote, &local_path, false).await {
+                    match client.download(remote, &local_path, true).await {
                         Ok(_) => {}
                         Err(e) => eprintln!("Error: {}", e),
                     }
@@ -385,7 +385,7 @@ async fn run_interactive(client: &QsftpClient) -> Result<()> {
                         }
                     } else {
                         eprintln!("Uploading {} -> {}", local_path.display(), remote);
-                        match client.upload(&local_path, &remote, false).await {
+                        match client.upload(&local_path, &remote, true).await {
                             Ok(_) => {}
                             Err(e) => eprintln!("Error: {}", e),
                         }
@@ -513,7 +513,7 @@ async fn download_recursive(client: &QsftpClient, remote_dir: &str, local_dir: &
                     Box::pin(download_recursive(client, &remote_path, &local_path)).await?;
                 } else {
                     eprintln!("Downloading {}", remote_path);
-                    client.download(&remote_path, &local_path, false).await?;
+                    client.download(&remote_path, &local_path, true).await?;
                 }
             }
         }
@@ -546,7 +546,7 @@ async fn upload_recursive(client: &QsftpClient, local_dir: &Path, remote_dir: &s
             Box::pin(upload_recursive(client, &local_path, &remote_path)).await?;
         } else {
             eprintln!("Uploading {}", local_path.display());
-            client.upload(&local_path, &remote_path, false).await?;
+            client.upload(&local_path, &remote_path, true).await?;
         }
     }
 
