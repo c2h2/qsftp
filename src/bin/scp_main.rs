@@ -57,26 +57,30 @@ async fn main() -> Result<()> {
             // Download
             let addr = resolve_host(host, args.port).await?;
             let client = connect_and_auth(addr, user, host, args.identity.as_deref(), &args.password).await?;
+            eprintln!("  Encryption : QUIC/TLS 1.3  cipher={}", client.tls_cipher);
+            eprintln!("  Compression: {}", if client.compress { "zstd (on)" } else { "none (old server)" });
 
             let local = PathBuf::from(local_path);
             if args.recursive {
                 download_recursive(&client, path, &local).await?;
             } else {
                 eprintln!("Downloading {} -> {}", path, local.display());
-                client.download(path, &local, true).await?;
+                client.download(path, &local).await?;
             }
         }
         (PathSpec::Local { path: local_path }, PathSpec::Remote { user, host, path }) => {
             // Upload
             let addr = resolve_host(host, args.port).await?;
             let client = connect_and_auth(addr, user, host, args.identity.as_deref(), &args.password).await?;
+            eprintln!("  Encryption : QUIC/TLS 1.3  cipher={}", client.tls_cipher);
+            eprintln!("  Compression: {}", if client.compress { "zstd (on)" } else { "none (old server)" });
 
             let local = PathBuf::from(local_path);
             if args.recursive {
                 upload_recursive(&client, &local, path).await?;
             } else {
                 eprintln!("Uploading {} -> {}", local.display(), path);
-                client.upload(&local, path, true).await?;
+                client.upload(&local, path).await?;
             }
         }
         _ => {
@@ -143,7 +147,7 @@ async fn download_recursive(client: &QsftpClient, remote_dir: &str, local_dir: &
                     Box::pin(download_recursive(client, &remote_path, &local_path)).await?;
                 } else {
                     eprintln!("Downloading {}", remote_path);
-                    client.download(&remote_path, &local_path, true).await?;
+                    client.download(&remote_path, &local_path).await?;
                 }
             }
         }
@@ -213,7 +217,7 @@ async fn upload_recursive(client: &QsftpClient, local_dir: &Path, remote_dir: &s
             Box::pin(upload_recursive(client, &local_path, &remote_path)).await?;
         } else {
             eprintln!("Uploading {}", local_path.display());
-            client.upload(&local_path, &remote_path, true).await?;
+            client.upload(&local_path, &remote_path).await?;
         }
     }
 

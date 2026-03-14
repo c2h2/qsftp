@@ -25,6 +25,15 @@ pub fn dynamic_chunk_size(file_size: u64) -> usize {
     }
 }
 
+/// Capabilities advertised by the server after auth.
+/// The client sends Caps{} to query; old servers return an error which the
+/// client treats as "no capabilities" for backwards compatibility.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct ServerCaps {
+    /// Server supports zstd per-transfer compression
+    pub zstd: bool,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Request {
     Auth { username: String, password: String },
@@ -32,6 +41,8 @@ pub enum Request {
     AuthPubKey { username: String, pub_key: String },
     /// SSH key auth step 2: client sends signature over the challenge
     AuthPubKeySign { signature: Vec<u8> },
+    /// Capability query — sent after auth; old servers return Error (caps = none)
+    Caps,
     Ls { path: String },
     Stat { path: String },
     Mkdir { path: String },
@@ -55,6 +66,8 @@ pub enum Response {
     FileStat { stat: FileStat },
     Pwd { path: String },
     FileData { size: u64, compress: bool },
+    /// Response to Caps query
+    CapsOk { caps: ServerCaps },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

@@ -261,6 +261,10 @@ async fn handle_command(
     let req: Request = read_msg(&mut recv).await?;
 
     match req {
+        Request::Caps => {
+            let caps = crate::protocol::ServerCaps { zstd: true };
+            write_msg(&mut send, &Response::CapsOk { caps }).await?;
+        }
         Request::Ls { path } => {
             let resolved = {
                 let sess = session.lock().await;

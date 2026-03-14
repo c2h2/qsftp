@@ -29,14 +29,13 @@ async fn run_pass(
     test_file: &PathBuf,
     dl_file: &PathBuf,
     remote: &str,
-    compress: bool,
     source_hash: &str,
 ) -> Result<BenchResult> {
+    let compress = client.compress;
     let file_size = tokio::fs::metadata(test_file).await?.len() as f64;
 
-    // Upload — measure wire size for compression ratio via a temp compressed file
+    // Measure compression ratio by compressing locally
     let ratio = if compress {
-        // Compress the source file locally to measure actual compressed size
         let raw_bytes = tokio::fs::read(test_file).await?;
         let compressed = tokio::task::spawn_blocking(move || {
             zstd::encode_all(raw_bytes.as_slice(), ZSTD_LEVEL)
@@ -47,13 +46,12 @@ async fn run_pass(
     };
 
     let start = std::time::Instant::now();
-    let sent = client.upload(test_file, remote, compress).await?;
+    let sent = client.upload(test_file, remote).await?;
     let up_elapsed = start.elapsed().as_secs_f64();
     let up_mibps = sent as f64 / up_elapsed / 1024.0 / 1024.0;
 
-    // Download
     let start = std::time::Instant::now();
-    let received = client.download(remote, dl_file, compress).await?;
+    let received = client.download(remote, dl_file).await?;
     let dl_elapsed = start.elapsed().as_secs_f64();
     let dl_mibps = received as f64 / dl_elapsed / 1024.0 / 1024.0;
 
@@ -94,8 +92,17 @@ async fn main() -> Result<()> {
     println!("=== QSFTP Benchmark: {} MiB ===", size_mb);
     println!("Connecting...");
 
-    let (connection, _endpoint) = QsftpClient::connect(addr, "localhost").await?;
-    let client = QsftpClient::authenticate(connection, "test", "test").await?;
+    // Two clients: one with compression off, one with compression on (caps-negotiated)
+    let (conn1, _ep1) = QsftpClient::connect(addr, "localhost").await?;
+    let mut client_plain = QsftpClient::authenticate(conn1, "test", "test").await?;
+    client_plain.compress = false; // force off for baseline
+
+    let (conn2, _ep2) = QsftpClient::connect(addr, "localhost").await?;
+    let client_zstd = QsftpClient::authenticate(conn2, "test", "test").await?;
+    // client_zstd.compress is set by caps negotiation (true if server supports it)
+
+    println!("  TLS cipher: {}", client_zstd.tls_cipher);
+    println!("  Compression: {}", if client_zstd.compress { "zstd (negotiated)" } else { "none (server too old)" });
 
     let test_file = PathBuf::from("/tmp/qsftp_bench_file.bin");
     let dl_file = PathBuf::from("/tmp/qsftp_bench_download.bin");
@@ -141,15 +148,13 @@ async fn main() -> Result<()> {
         println!("done");
 
         let source_hash = sha256_file(&test_file).await?;
-        let _ = tc.compressible; // suppress unused warning
         println!("  SHA-256: {}", source_hash);
 
         let mut results = Vec::new();
 
-        for compress in [false, true] {
-            let label = if compress { "zstd" } else { "plain" };
+        for (label, client) in [("plain", &client_plain), ("zstd", &client_zstd)] {
             print!("  Running {} pass... ", label);
-            let r = run_pass(&client, &test_file, &dl_file, remote, compress, &source_hash).await?;
+            let r = run_pass(client, &test_file, &dl_file, remote, &source_hash).await?;
             println!("upload {:.1} MiB/s  download {:.1} MiB/s  integrity OK", r.up_mibps, r.dl_mibps);
             results.push(r);
         }

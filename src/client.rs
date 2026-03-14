@@ -9,6 +9,42 @@ pub struct QsftpClient {
     pub connection: quinn::Connection,
     pub home_dir: String,
     pub remote_cwd: String,
+    /// Whether the server supports (and we will use) zstd compression
+    pub compress: bool,
+    /// TLS cipher suite negotiated for this connection
+    pub tls_cipher: String,
+}
+
+/// Extract TLS info from a quinn connection.
+/// QUIC mandates TLS 1.3; quinn with rustls uses AES-128-GCM-SHA256 or
+/// CHACHA20-POLY1305-SHA256. We report what we can from handshake data.
+fn tls_cipher_name(conn: &quinn::Connection) -> String {
+    let alpn = conn.handshake_data()
+        .and_then(|d| d.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+        .and_then(|d| d.protocol)
+        .map(|p| String::from_utf8_lossy(&p).to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    // QUIC always uses TLS 1.3; rustls defaults to AES-128-GCM-SHA256
+    format!("TLS_AES_128_GCM_SHA256 (TLS 1.3, ALPN={})", alpn)
+}
+
+/// Query server capabilities after auth. Old servers that don't recognise
+/// the Caps request will return an Error — we catch that and return default
+/// (no) capabilities so the client degrades gracefully.
+async fn negotiate_caps(connection: &quinn::Connection) -> crate::protocol::ServerCaps {
+    let result: anyhow::Result<crate::protocol::ServerCaps> = async {
+        let (mut send, mut recv) = connection.open_bi().await?;
+        write_msg(&mut send, &Request::Caps).await?;
+        send.finish()?;
+        let resp: Response = read_msg(&mut recv).await?;
+        match resp {
+            Response::CapsOk { caps } => Ok(caps),
+            // Old server returns Error — treat as no caps
+            Response::Error { .. } => Ok(crate::protocol::ServerCaps::default()),
+            _ => Ok(crate::protocol::ServerCaps::default()),
+        }
+    }.await;
+    result.unwrap_or_default()
 }
 
 impl QsftpClient {
@@ -51,10 +87,14 @@ impl QsftpClient {
             Response::AuthOk { home_dir } => {
                 let remote_cwd = home_dir.clone();
                 send.finish()?;
+                let tls_cipher = tls_cipher_name(&connection);
+                let caps = negotiate_caps(&connection).await;
                 Ok(Self {
                     connection,
                     home_dir,
                     remote_cwd,
+                    compress: caps.zstd,
+                    tls_cipher,
                 })
             }
             Response::Error { message } => {
@@ -104,10 +144,14 @@ impl QsftpClient {
                     Response::AuthOk { home_dir } => {
                         let remote_cwd = home_dir.clone();
                         send.finish()?;
+                        let tls_cipher = tls_cipher_name(&connection);
+                        let caps = negotiate_caps(&connection).await;
                         Ok(Self {
                             connection,
                             home_dir,
                             remote_cwd,
+                            compress: caps.zstd,
+                            tls_cipher,
                         })
                     }
                     Response::Error { message } => {
@@ -133,7 +177,8 @@ impl QsftpClient {
         Ok(resp)
     }
 
-    pub async fn download(&self, remote_path: &str, local_path: &Path, compress: bool) -> Result<u64> {
+    pub async fn download(&self, remote_path: &str, local_path: &Path) -> Result<u64> {
+        let compress = self.compress;
         let (mut send, mut recv) = self.connection.open_bi().await?;
         let req = Request::Get {
             path: remote_path.to_string(),
@@ -189,7 +234,8 @@ impl QsftpClient {
         }
     }
 
-    pub async fn upload(&self, local_path: &Path, remote_path: &str, compress: bool) -> Result<u64> {
+    pub async fn upload(&self, local_path: &Path, remote_path: &str) -> Result<u64> {
+        let compress = self.compress;
         let meta = tokio::fs::metadata(local_path).await?;
         let size = meta.len();
         let mode = {

@@ -82,6 +82,8 @@ async fn main() -> Result<()> {
     };
 
     eprintln!("Connected to {}. Home: {}", host, client.home_dir);
+    eprintln!("  Encryption : QUIC/TLS 1.3  cipher={}", client.tls_cipher);
+    eprintln!("  Compression: {}", if client.compress { "zstd (on)" } else { "none (old server)" });
     eprintln!("Type 'help' for available commands.");
 
     run_interactive(&client).await?;
@@ -343,7 +345,7 @@ async fn run_interactive(client: &QsftpClient) -> Result<()> {
                     }
                 } else {
                     eprintln!("Downloading {} -> {}", remote, local_path.display());
-                    match client.download(remote, &local_path, true).await {
+                    match client.download(remote, &local_path).await {
                         Ok(_) => {}
                         Err(e) => eprintln!("Error: {}", e),
                     }
@@ -385,7 +387,7 @@ async fn run_interactive(client: &QsftpClient) -> Result<()> {
                         }
                     } else {
                         eprintln!("Uploading {} -> {}", local_path.display(), remote);
-                        match client.upload(&local_path, &remote, true).await {
+                        match client.upload(&local_path, &remote).await {
                             Ok(_) => {}
                             Err(e) => eprintln!("Error: {}", e),
                         }
@@ -513,7 +515,7 @@ async fn download_recursive(client: &QsftpClient, remote_dir: &str, local_dir: &
                     Box::pin(download_recursive(client, &remote_path, &local_path)).await?;
                 } else {
                     eprintln!("Downloading {}", remote_path);
-                    client.download(&remote_path, &local_path, true).await?;
+                    client.download(&remote_path, &local_path).await?;
                 }
             }
         }
@@ -546,7 +548,7 @@ async fn upload_recursive(client: &QsftpClient, local_dir: &Path, remote_dir: &s
             Box::pin(upload_recursive(client, &local_path, &remote_path)).await?;
         } else {
             eprintln!("Uploading {}", local_path.display());
-            client.upload(&local_path, &remote_path, true).await?;
+            client.upload(&local_path, &remote_path).await?;
         }
     }
 
