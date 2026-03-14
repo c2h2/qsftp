@@ -101,7 +101,7 @@ main() {
     tar -xzf "${TMPDIR}/${TARBALL}" -C "$TMPDIR"
 
     # Install binaries
-    BINARIES="qsftp-server qsftp qscp"
+    BINARIES="qsshd qsftp qscp qssh"
     info "Installing to ${INSTALL_DIR}/"
 
     if [ -w "$INSTALL_DIR" ]; then
@@ -122,8 +122,8 @@ main() {
     fi
 
     # Verify
-    if command -v qsftp-server > /dev/null 2>&1; then
-        ok "qsftp-server is available in PATH"
+    if command -v qsshd > /dev/null 2>&1; then
+        ok "qsshd is available in PATH"
     else
         warn "${INSTALL_DIR} may not be in your PATH"
         # Add to PATH via /etc/profile.d if possible
@@ -153,20 +153,21 @@ main() {
 
     printf '\n\033[1m  Installation complete!\033[0m\n\n'
     printf '  Usage:\n'
-    printf '    qsftp-server              Start server on :1022\n'
+    printf '    qsshd                     Start server on :1022\n'
+    printf '    qssh user@host            Interactive SSH session\n'
     printf '    qsftp user@host           Interactive SFTP session\n'
     printf '    qscp file user@host:path  Copy files\n\n'
 
     if [ "$SKIP_SERVICE" != "1" ] && [ "$OS" = "linux" ] && command -v systemctl > /dev/null 2>&1; then
         printf '  Service:\n'
-        printf '    sudo systemctl status qsftp-server   # check status\n'
-        printf '    sudo systemctl restart qsftp-server  # restart\n'
-        printf '    sudo journalctl -u qsftp-server -f   # view logs\n\n'
+        printf '    sudo systemctl status qsshd   # check status\n'
+        printf '    sudo systemctl restart qsshd  # restart\n'
+        printf '    sudo journalctl -u qsshd -f   # view logs\n\n'
     fi
 }
 
 install_service() {
-    SERVICE_FILE="/etc/systemd/system/qsftp-server.service"
+    SERVICE_FILE="/etc/systemd/system/qsshd.service"
     info "Installing systemd service..."
 
     SERVICE_CONTENT="[Unit]
@@ -176,7 +177,7 @@ Documentation=https://github.com/${REPO}
 
 [Service]
 Type=simple
-ExecStart=${INSTALL_DIR}/qsftp-server --listen [::]:${DEFAULT_PORT} --listen 0.0.0.0:${DEFAULT_PORT}
+ExecStart=${INSTALL_DIR}/qsshd --listen [::]:${DEFAULT_PORT} --listen 0.0.0.0:${DEFAULT_PORT}
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536
@@ -207,12 +208,12 @@ WantedBy=multi-user.target
     # Reload systemd
     if [ -w "/etc/systemd/system" ]; then
         systemctl daemon-reload
-        systemctl enable qsftp-server
-        systemctl restart qsftp-server
+        systemctl enable qsshd
+        systemctl restart qsshd
     else
         sudo systemctl daemon-reload
-        sudo systemctl enable qsftp-server
-        sudo systemctl restart qsftp-server
+        sudo systemctl enable qsshd
+        sudo systemctl restart qsshd
     fi
     ok "Systemd daemon reloaded"
     ok "Service enabled and started"

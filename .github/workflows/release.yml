@@ -50,7 +50,7 @@ jobs:
           VERSION="${GITHUB_REF_NAME}"
           TARBALL="qsftp-${VERSION}-${{ matrix.arch }}-${{ matrix.os }}.tar.gz"
           STAGE=$(mktemp -d)
-          for bin in qsftp-server qsftp qscp; do
+          for bin in qsshd qsftp qscp qssh; do
             cp "target/${{ matrix.target }}/release/${bin}" "${STAGE}/${bin}"
           done
           tar -czf "${TARBALL}" -C "${STAGE}" .
@@ -81,7 +81,7 @@ jobs:
           VERSION="${GITHUB_REF_NAME}"
           TARBALL="qsftp-${VERSION}-aarch64-darwin.tar.gz"
           STAGE=$(mktemp -d)
-          for bin in qsftp-server qsftp qscp; do
+          for bin in qsshd qsftp qscp qssh; do
             cp "target/aarch64-apple-darwin/release/${bin}" "${STAGE}/${bin}"
           done
           tar -czf "${TARBALL}" -C "${STAGE}" .
