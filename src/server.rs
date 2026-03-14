@@ -8,6 +8,7 @@ use tracing::{error, info, warn};
 use crate::auth;
 use crate::protocol::*;
 
+
 pub async fn run_server(
     listen_addrs: &[SocketAddr],
     server_config: quinn::ServerConfig,
@@ -214,11 +215,13 @@ async fn handle_connection(incoming: quinn::Incoming, no_auth: bool) -> Result<(
     drop(recv);
 
     let cwd = PathBuf::from(&user_info.home);
+    let home = user_info.home.clone();
 
     // Session state shared across stream handlers
     let session = std::sync::Arc::new(tokio::sync::Mutex::new(SessionState {
         _user: user_info,
         cwd,
+        home,
     }));
 
     // Handle subsequent command streams
@@ -242,6 +245,7 @@ async fn handle_connection(incoming: quinn::Incoming, no_auth: bool) -> Result<(
                 error!("Command error: {}", e);
             }
         });
+
     }
 
     Ok(())
@@ -250,6 +254,7 @@ async fn handle_connection(incoming: quinn::Incoming, no_auth: bool) -> Result<(
 struct SessionState {
     _user: auth::UserInfo,
     cwd: PathBuf,
+    home: String,
 }
 
 async fn handle_command(
@@ -259,6 +264,11 @@ async fn handle_command(
     connection: Connection,
 ) -> Result<()> {
     let req: Request = read_msg(&mut recv).await?;
+
+    let user_home = {
+        let sess = session.lock().await;
+        sess.home.clone()
+    };
 
     match req {
         Request::Caps => {
@@ -486,6 +496,26 @@ async fn handle_command(
             // Send confirmation on the command stream
             write_msg(&mut send, &Response::Ok).await?;
         }
+        Request::Shell { term, cols, rows } => {
+            handle_shell(send, recv, &user_home, &term, cols, rows).await?;
+            return Ok(());
+        }
+        Request::Exec { command } => {
+            handle_exec(send, recv, &user_home, &command).await?;
+            return Ok(());
+        }
+        Request::TcpForward { host, port } => {
+            handle_tcp_forward(send, recv, &host, port).await?;
+            return Ok(());
+        }
+        Request::RemoteForwardBind { bind, port } => {
+            handle_remote_forward_bind(send, connection.clone(), &bind, port).await?;
+            return Ok(());
+        }
+        Request::WindowChange { .. } => {
+            // Window changes arrive on the shell stream, not here
+            write_msg(&mut send, &Response::Error { message: "WindowChange only valid inside shell session".into() }).await?;
+        }
         Request::Auth { .. } | Request::AuthPubKey { .. } | Request::AuthPubKeySign { .. } => {
             write_msg(
                 &mut send,
@@ -498,6 +528,262 @@ async fn handle_command(
     }
 
     send.finish()?;
+    Ok(())
+}
+
+// ── Shell session ────────────────────────────────────────────────────────────
+
+async fn handle_shell(
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    home: &str,
+    term: &str,
+    cols: u16,
+    rows: u16,
+) -> Result<()> {
+    use std::os::unix::io::FromRawFd;
+
+    // Open a PTY pair
+    let (master_fd, slave_fd) = open_pty(cols, rows)?;
+
+    // Spawn shell
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let mut child = unsafe {
+        let slave_raw = slave_fd;
+        let mut cmd = tokio::process::Command::new(&shell);
+        cmd.current_dir(home)
+            .env("TERM", term)
+            .env("HOME", home)
+            .stdin(std::process::Stdio::from_raw_fd(slave_raw))
+            .stdout(std::process::Stdio::from_raw_fd(slave_raw))
+            .stderr(std::process::Stdio::from_raw_fd(slave_raw))
+            .pre_exec(|| {
+                // Make this process the session leader and controlling terminal
+                libc::setsid();
+                libc::ioctl(0, libc::TIOCSCTTY as _, 0i32);
+                Ok(())
+            });
+        cmd.spawn()?
+    };
+
+    write_msg(&mut send, &Response::SessionOk).await?;
+
+    // Wrap master fd in async I/O
+    let master_file = unsafe { std::fs::File::from_raw_fd(master_fd) };
+    let master_async = tokio::fs::File::from_std(master_file);
+    let (mut pty_read, mut pty_write) = tokio::io::split(master_async);
+
+    // Network → PTY (client keystrokes → shell)
+    let net_to_pty = tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = match recv.read(&mut buf).await {
+                Ok(Some(n)) => n,
+                _ => break,
+            };
+            if n == 0 { break; }
+            if pty_write.write_all(&buf[..n]).await.is_err() { break; }
+        }
+    });
+
+    // PTY → network (shell output → client)
+    let pty_to_net = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = match pty_read.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            if send.write_all(&buf[..n]).await.is_err() { break; }
+        }
+        let _ = send.finish();
+    });
+
+    let code = child.wait().await.map(|s| s.code().unwrap_or(0)).unwrap_or(1);
+    net_to_pty.abort();
+    pty_to_net.abort();
+
+    info!("Shell exited with code {}", code);
+    Ok(())
+}
+
+// ── Remote port forward (-R) server side ────────────────────────────────────
+
+async fn handle_remote_forward_bind(
+    mut send: quinn::SendStream,
+    conn: Connection,
+    bind: &str,
+    port: u16,
+) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = match tokio::net::TcpListener::bind(format!("{}:{}", bind, port)).await {
+        Ok(l) => l,
+        Err(e) => {
+            write_msg(&mut send, &Response::Error {
+                message: format!("Cannot bind {}:{}: {}", bind, port, e),
+            }).await?;
+            send.finish()?;
+            return Ok(());
+        }
+    };
+
+    write_msg(&mut send, &Response::SessionOk).await?;
+    // Keep ctrl send open so client knows we're alive; drop when we exit.
+    info!("Remote forward: listening on {}:{}", bind, port);
+
+    loop {
+        let (tcp, peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+        tracing::debug!("Remote forward: inbound TCP from {}", peer);
+        let conn2 = conn.clone();
+
+        tokio::spawn(async move {
+            let result: Result<()> = async {
+                // Open a new bi-stream toward the client
+                let (mut fwd_send, mut fwd_recv) = conn2.open_bi().await?;
+                let (mut tcp_read, mut tcp_write) = tcp.into_split();
+
+                let t2q = tokio::spawn(async move {
+                    let mut buf = [0u8; 65536];
+                    loop {
+                        let n = match tcp_read.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => n,
+                        };
+                        if fwd_send.write_all(&buf[..n]).await.is_err() { break; }
+                    }
+                    let _ = fwd_send.finish();
+                });
+
+                let q2t = tokio::spawn(async move {
+                    let mut buf = [0u8; 65536];
+                    loop {
+                        let n = match fwd_recv.read(&mut buf).await {
+                            Ok(Some(n)) if n > 0 => n,
+                            _ => break,
+                        };
+                        if tcp_write.write_all(&buf[..n]).await.is_err() { break; }
+                    }
+                });
+
+                let _ = tokio::join!(t2q, q2t);
+                Ok(())
+            }.await;
+            if let Err(e) = result {
+                tracing::debug!("Remote forward session error: {}", e);
+            }
+        });
+    }
+
+    Ok(())
+}
+
+fn open_pty(cols: u16, rows: u16) -> Result<(i32, i32)> {
+    unsafe {
+        let mut master: libc::c_int = -1;
+        let mut slave: libc::c_int = -1;
+        let mut ws = libc::winsize {
+            ws_col: cols,
+            ws_row: rows,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let ret = libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut ws,
+        );
+        if ret != 0 {
+            anyhow::bail!("openpty failed: {}", std::io::Error::last_os_error());
+        }
+        Ok((master, slave))
+    }
+}
+
+// ── Exec (non-interactive command) ──────────────────────────────────────────
+
+async fn handle_exec(
+    mut send: quinn::SendStream,
+    mut _recv: quinn::RecvStream,
+    home: &str,
+    command: &str,
+) -> Result<()> {
+    let output = tokio::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(home)
+        .output()
+        .await?;
+
+    let code = output.status.code().unwrap_or(1);
+
+    write_msg(&mut send, &Response::ExecData {
+        stdout: output.stdout,
+        stderr: output.stderr,
+        done: true,
+    }).await?;
+    write_msg(&mut send, &Response::ExitStatus { code }).await?;
+    send.finish()?;
+    Ok(())
+}
+
+// ── TCP port forwarding ──────────────────────────────────────────────────────
+
+async fn handle_tcp_forward(
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    host: &str,
+    port: u16,
+) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let target = format!("{}:{}", host, port);
+    let tcp = match tokio::net::TcpStream::connect(&target).await {
+        Ok(s) => s,
+        Err(e) => {
+            write_msg(&mut send, &Response::Error {
+                message: format!("Cannot connect to {}: {}", target, e),
+            }).await?;
+            send.finish()?;
+            return Ok(());
+        }
+    };
+
+    write_msg(&mut send, &Response::SessionOk).await?;
+
+    let (mut tcp_read, mut tcp_write) = tcp.into_split();
+
+    let net_to_tcp = tokio::spawn(async move {
+        let mut buf = [0u8; 65536];
+        loop {
+            let n = match recv.read(&mut buf).await {
+                Ok(Some(n)) if n > 0 => n,
+                _ => break,
+            };
+            if tcp_write.write_all(&buf[..n]).await.is_err() { break; }
+        }
+    });
+
+    let tcp_to_net = tokio::spawn(async move {
+        let mut buf = [0u8; 65536];
+        loop {
+            let n = match tcp_read.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            if send.write_all(&buf[..n]).await.is_err() { break; }
+        }
+        let _ = send.finish();
+    });
+
+    let _ = tokio::join!(net_to_tcp, tcp_to_net);
     Ok(())
 }
 

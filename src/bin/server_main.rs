@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "qsftp-server", version = env!("GIT_VERSION"), about = "QSFTP server - SFTP over QUIC")]
+#[command(name = "qsshd", version = env!("GIT_VERSION"), about = "qsshd - SFTP/SSH server over QUIC")]
 struct Args {
     /// Listen address (can be specified multiple times; defaults to [::]:1022 and 0.0.0.0:1022)
     #[arg(short, long)]

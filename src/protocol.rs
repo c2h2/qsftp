@@ -4,6 +4,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const DEFAULT_PORT: u16 = 1022;
 pub const ALPN_QSFTP: &[u8] = b"qsftp/1";
+pub const DEFAULT_SSH_PORT: u16 = 1022;
 
 const MIN_CHUNK: usize = 256 * 1024;      // 256 KiB
 const MAX_CHUNK: usize = 16 * 1024 * 1024; // 16 MiB
@@ -53,6 +54,39 @@ pub enum Request {
     Put { path: String, size: u64, mode: u32, compress: bool },
     Pwd,
     Cd { path: String },
+    /// Open an interactive shell session (PTY)
+    Shell {
+        /// Terminal type (e.g. "xterm-256color")
+        term: String,
+        /// Initial terminal width in columns
+        cols: u16,
+        /// Initial terminal height in rows
+        rows: u16,
+    },
+    /// Execute a single command and return its output
+    Exec {
+        /// Command line to execute via /bin/sh -c
+        command: String,
+    },
+    /// Terminal resize notification (sent mid-session)
+    WindowChange { cols: u16, rows: u16 },
+    /// Local → remote TCP forward: server opens connection to target host:port
+    /// and bridges it to the stream.  Client sends this request then streams
+    /// raw TCP data on the same bi-directional QUIC stream.
+    TcpForward {
+        /// Target host
+        host: String,
+        /// Target port
+        port: u16,
+    },
+    /// Remote port forward bind: server listens on bind:port and for each
+    /// accepted TCP connection opens a new bi-stream to the client.
+    RemoteForwardBind {
+        /// Bind address on server (e.g. "127.0.0.1" or "0.0.0.0")
+        bind: String,
+        /// Port to listen on
+        port: u16,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -68,6 +102,12 @@ pub enum Response {
     FileData { size: u64, compress: bool },
     /// Response to Caps query
     CapsOk { caps: ServerCaps },
+    /// Shell/exec session opened; data flows on the same bi-stream after this
+    SessionOk,
+    /// Shell/exec exited with the given status code
+    ExitStatus { code: i32 },
+    /// Exec stdout/stderr chunk (used in non-interactive exec mode)
+    ExecData { stdout: Vec<u8>, stderr: Vec<u8>, done: bool },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
