@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use anyhow::Result;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const DEFAULT_PORT: u16 = 1022;
 pub const ALPN_QSFTP: &[u8] = b"qsftp/1";
@@ -99,4 +99,61 @@ pub async fn read_msg<R: AsyncReadExt + Unpin, T: for<'de> Deserialize<'de>>(
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf).await?;
     Ok(bincode::deserialize(&buf)?)
+}
+
+/// Pipelined chunk transfer: reader and writer run concurrently with a
+/// bounded channel between them so disk I/O and network I/O overlap.
+/// `queue_depth` controls how many chunks can be in-flight at once.
+/// Returns `(bytes_transferred, writer)` so the caller can finalize the
+/// writer (e.g. call `finish()` on a quinn SendStream).
+pub async fn pipe_chunks<R, W>(
+    mut reader: R,
+    mut writer: W,
+    chunk_size: usize,
+    queue_depth: usize,
+) -> Result<(u64, W)>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(queue_depth);
+
+    // Reader task: read chunks from source and push onto channel
+    let reader_task = tokio::spawn(async move {
+        let mut total = 0u64;
+        loop {
+            let mut buf = vec![0u8; chunk_size];
+            let mut filled = 0usize;
+            // Fill the buffer fully before sending (avoids tiny sends)
+            while filled < chunk_size {
+                match reader.read(&mut buf[filled..]).await {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(e) => return Err(anyhow::anyhow!(e)),
+                }
+            }
+            if filled == 0 {
+                break;
+            }
+            buf.truncate(filled);
+            total += filled as u64;
+            if tx.send(bytes::Bytes::from(buf)).await.is_err() {
+                break;
+            }
+        }
+        Ok::<u64, anyhow::Error>(total)
+    });
+
+    // Writer task: drain channel and write to destination, then return writer
+    let writer_task = tokio::spawn(async move {
+        while let Some(chunk) = rx.recv().await {
+            writer.write_all(&chunk).await?;
+        }
+        writer.flush().await?;
+        Ok::<W, anyhow::Error>(writer)
+    });
+
+    let (read_res, write_res) = tokio::join!(reader_task, writer_task);
+    let writer = write_res??;
+    Ok((read_res??, writer))
 }

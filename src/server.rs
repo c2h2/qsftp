@@ -3,7 +3,6 @@ use quinn::{Connection, Endpoint};
 use std::net::SocketAddr;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use tokio::io::AsyncWriteExt;
 use tracing::{error, info, warn};
 
 use crate::auth;
@@ -431,13 +430,10 @@ async fn handle_command(
                     write_msg(&mut send, &Response::FileData { size }).await?;
 
                     // Send file data on a new uni stream
-                    let mut uni_send = connection.open_uni().await?;
+                    let uni_send = connection.open_uni().await?;
 
-                    let mut file = tokio::io::BufReader::with_capacity(
-                        chunk,
-                        tokio::fs::File::open(&resolved).await?,
-                    );
-                    tokio::io::copy_buf(&mut file, &mut uni_send).await?;
+                    let file = tokio::fs::File::open(&resolved).await?;
+                    let (_, mut uni_send) = crate::protocol::pipe_chunks(file, uni_send, chunk, 8).await?;
                     uni_send.finish()?;
                 }
                 Err(e) => {
@@ -467,14 +463,9 @@ async fn handle_command(
 
             // Receive file data on a uni stream
             let uni_recv = connection.accept_uni().await?;
-            let mut buffered_recv = tokio::io::BufReader::with_capacity(chunk, uni_recv);
-            let mut file = tokio::io::BufWriter::with_capacity(
-                chunk,
-                tokio::fs::File::create(&resolved).await?,
-            );
-            tokio::io::copy_buf(&mut buffered_recv, &mut file).await?;
-            file.flush().await?;
-            drop(file);
+            let file = tokio::fs::File::create(&resolved).await?;
+            crate::protocol::pipe_chunks(uni_recv, file, chunk, 8).await?;
+            // file flushed and dropped inside pipe_chunks
 
             // Set permissions
             set_permissions(&resolved, mode).await?;

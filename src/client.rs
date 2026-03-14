@@ -2,7 +2,6 @@ use anyhow::Result;
 use quinn::Endpoint;
 use std::net::SocketAddr;
 use std::path::Path;
-use tokio::io::AsyncWriteExt;
 
 use crate::protocol::*;
 
@@ -158,15 +157,10 @@ impl QsftpClient {
                 }
 
                 let chunk = crate::protocol::dynamic_chunk_size(size);
-                let mut buffered_recv = tokio::io::BufReader::with_capacity(chunk, uni_recv);
-                let mut file = tokio::io::BufWriter::with_capacity(
-                    chunk,
-                    tokio::fs::File::create(local_path).await?,
-                );
+                let file = tokio::fs::File::create(local_path).await?;
                 let start = std::time::Instant::now();
 
-                let received = tokio::io::copy_buf(&mut buffered_recv, &mut file).await?;
-                file.flush().await?;
+                let (received, _file) = crate::protocol::pipe_chunks(uni_recv, file, chunk, 8).await?;
 
                 let elapsed = start.elapsed().as_secs_f64();
                 let speed = received as f64 / elapsed / 1024.0 / 1024.0;
@@ -208,16 +202,13 @@ impl QsftpClient {
         match resp {
             Response::Ok => {
                 // Send file data on uni stream
-                let mut uni_send = self.connection.open_uni().await?;
+                let uni_send = self.connection.open_uni().await?;
 
                 let chunk = crate::protocol::dynamic_chunk_size(size);
-                let mut file = tokio::io::BufReader::with_capacity(
-                    chunk,
-                    tokio::fs::File::open(local_path).await?,
-                );
+                let file = tokio::fs::File::open(local_path).await?;
                 let start = std::time::Instant::now();
 
-                let sent = tokio::io::copy_buf(&mut file, &mut uni_send).await?;
+                let (sent, mut uni_send) = crate::protocol::pipe_chunks(file, uni_send, chunk, 8).await?;
                 uni_send.finish()?;
 
                 // Wait for server confirmation
