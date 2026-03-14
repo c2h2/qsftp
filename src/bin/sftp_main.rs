@@ -1,7 +1,13 @@
 use anyhow::Result;
 use clap::Parser;
+use rustyline::completion::{Completer, FilenameCompleter, Pair};
+use rustyline::error::ReadlineError;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::validate::Validator;
+use rustyline::{CompletionType, Config, Context, Editor};
+use rustyline_derive::Helper;
 use std::path::{Path, PathBuf};
-use tokio::io::{AsyncBufReadExt, BufReader};
 
 use qsftp::client::QsftpClient;
 use qsftp::protocol::*;
@@ -103,37 +109,106 @@ fn parse_destination(dest: &str) -> Result<(String, String)> {
     }
 }
 
+/// rustyline helper: local filesystem tab completion
+#[derive(Helper)]
+struct SftpHelper {
+    file_completer: FilenameCompleter,
+}
+
+impl Completer for SftpHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        self.file_completer.complete(line, pos, ctx)
+    }
+}
+
+impl Hinter for SftpHelper {
+    type Hint = String;
+}
+
+impl Highlighter for SftpHelper {}
+impl Validator for SftpHelper {}
+
+/// Expand a token that may contain glob characters against the local filesystem.
+/// Returns the original token unchanged if it has no glob chars or no matches.
+fn expand_local_glob(local_cwd: &Path, token: &str) -> Vec<String> {
+    // Only expand if the token contains glob metacharacters
+    if !token.contains('*') && !token.contains('?') && !token.contains('[') {
+        return vec![token.to_string()];
+    }
+
+    let pattern = if Path::new(token).is_absolute() {
+        token.to_string()
+    } else {
+        local_cwd.join(token).to_string_lossy().to_string()
+    };
+
+    match glob::glob(&pattern) {
+        Ok(paths) => {
+            let matches: Vec<String> = paths
+                .filter_map(|p| p.ok())
+                .map(|p| p.to_string_lossy().to_string())
+                .collect();
+            if matches.is_empty() {
+                vec![token.to_string()]
+            } else {
+                matches
+            }
+        }
+        Err(_) => vec![token.to_string()],
+    }
+}
+
 async fn run_interactive(client: &QsftpClient) -> Result<()> {
-    let stdin = tokio::io::stdin();
-    let mut reader = BufReader::new(stdin);
-    let mut line = String::new();
     let mut local_cwd = std::env::current_dir()?;
 
+    let config = Config::builder()
+        .completion_type(CompletionType::List)
+        .build();
+    let helper = SftpHelper {
+        file_completer: FilenameCompleter::new(),
+    };
+    let mut rl = Editor::with_config(config)?;
+    rl.set_helper(Some(helper));
+
     loop {
-        eprint!("qsftp> ");
-        line.clear();
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 {
-            break; // EOF
-        }
-        let line = line.trim();
-        if line.is_empty() {
+        let readline = rl.readline("qsftp> ");
+        let input = match readline {
+            Ok(line) => {
+                let trimmed = line.trim().to_string();
+                if !trimmed.is_empty() {
+                    rl.add_history_entry(&trimmed)?;
+                }
+                trimmed
+            }
+            Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => break,
+            Err(e) => return Err(e.into()),
+        };
+
+        if input.is_empty() {
             continue;
         }
 
-        let parts: Vec<&str> = line.split_whitespace().collect();
+        let parts: Vec<&str> = input.split_whitespace().collect();
         let cmd = parts[0];
 
         match cmd {
             "help" | "?" => {
                 println!("Commands:");
                 println!("  ls [path]        - List remote directory");
+                println!("  lls [path]       - List local directory");
                 println!("  cd <path>        - Change remote directory");
                 println!("  pwd              - Print remote working directory");
                 println!("  lpwd             - Print local working directory");
                 println!("  lcd <path>       - Change local directory");
                 println!("  get [-r] <remote> [local] - Download file (-r for recursive)");
-                println!("  put [-r] <local> [remote] - Upload file (-r for recursive)");
+                println!("  put [-r] <local> [remote] - Upload file(s) (-r for recursive, globs ok)");
                 println!("  mkdir <path>     - Create remote directory");
                 println!("  rm <path>        - Remove remote file/directory");
                 println!("  rename <old> <new> - Rename remote file");
@@ -161,6 +236,38 @@ async fn run_interactive(client: &QsftpClient) -> Result<()> {
                     }
                     Response::Error { message } => eprintln!("Error: {}", message),
                     _ => eprintln!("Unexpected response"),
+                }
+            }
+            "lls" => {
+                let dir = if parts.len() > 1 {
+                    if Path::new(parts[1]).is_absolute() {
+                        PathBuf::from(parts[1])
+                    } else {
+                        local_cwd.join(parts[1])
+                    }
+                } else {
+                    local_cwd.clone()
+                };
+                match std::fs::read_dir(&dir) {
+                    Ok(entries) => {
+                        let mut names: Vec<String> = entries
+                            .filter_map(|e| e.ok())
+                            .map(|e| {
+                                let name = e.file_name().to_string_lossy().to_string();
+                                if e.path().is_dir() {
+                                    format!("{}/", name)
+                                } else {
+                                    name
+                                }
+                            })
+                            .collect();
+                        names.sort();
+                        for name in &names {
+                            println!("{}", name);
+                        }
+                        println!("({} entries)", names.len());
+                    }
+                    Err(e) => eprintln!("Error: {}", e),
                 }
             }
             "cd" => {
@@ -249,31 +356,39 @@ async fn run_interactive(client: &QsftpClient) -> Result<()> {
                     eprintln!("Usage: put [-r] <local> [remote]");
                     continue;
                 }
-                let local_name = parts[arg_start];
-                let local_path = if Path::new(local_name).is_absolute() {
-                    PathBuf::from(local_name)
+                let local_pattern = parts[arg_start];
+                // Explicit remote destination only makes sense for single-file transfers
+                let explicit_remote = if parts.len() > arg_start + 1 {
+                    Some(parts[arg_start + 1].to_string())
                 } else {
-                    local_cwd.join(local_name)
+                    None
                 };
-                let remote = if parts.len() > arg_start + 1 {
-                    parts[arg_start + 1].to_string()
-                } else {
-                    Path::new(local_name)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or(local_name)
-                        .to_string()
-                };
-                if recursive {
-                    match upload_recursive(client, &local_path, &remote).await {
-                        Ok(_) => {}
-                        Err(e) => eprintln!("Error: {}", e),
-                    }
-                } else {
-                    eprintln!("Uploading {} -> {}", local_path.display(), remote);
-                    match client.upload(&local_path, &remote).await {
-                        Ok(_) => {}
-                        Err(e) => eprintln!("Error: {}", e),
+
+                let expanded = expand_local_glob(&local_cwd, local_pattern);
+                let multi = expanded.len() > 1;
+
+                for local_str in &expanded {
+                    let local_path = PathBuf::from(local_str);
+                    let remote: String = if let (Some(ref r), false) = (&explicit_remote, multi) {
+                        r.clone()
+                    } else {
+                        local_path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or(local_str.as_str())
+                            .to_string()
+                    };
+                    if recursive {
+                        match upload_recursive(client, &local_path, &remote).await {
+                            Ok(_) => {}
+                            Err(e) => eprintln!("Error: {}", e),
+                        }
+                    } else {
+                        eprintln!("Uploading {} -> {}", local_path.display(), remote);
+                        match client.upload(&local_path, &remote).await {
+                            Ok(_) => {}
+                            Err(e) => eprintln!("Error: {}", e),
+                        }
                     }
                 }
             }

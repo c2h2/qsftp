@@ -98,3 +98,14 @@ done
 
 echo "=== Done: ${BUILT} built, ${SKIPPED} skipped ==="
 ls -lh "${OUTDIR}/"
+
+# Build native executable for current host
+echo
+echo "--- Building native executable for host (${HOST_OS} ${HOST_ARCH}) ---"
+cargo build --release
+
+# Copy binaries to project root
+for bin in ${BINARIES}; do
+    cp "target/release/${bin}" "./${bin}"
+    echo "==> Copied ./${bin}"
+done

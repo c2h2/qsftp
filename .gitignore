@@ -1,2 +1,5 @@
 /target
 /to_github
+/qsftp
+/qsftp-server
+/qscp
