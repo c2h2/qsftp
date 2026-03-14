@@ -2,7 +2,7 @@ use anyhow::Result;
 use quinn::Endpoint;
 use std::net::SocketAddr;
 use std::path::Path;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
 use crate::protocol::*;
 
@@ -146,7 +146,7 @@ impl QsftpClient {
         match resp {
             Response::FileData { size } => {
                 // Receive data on uni stream with timeout
-                let mut uni_recv = tokio::time::timeout(
+                let uni_recv = tokio::time::timeout(
                     std::time::Duration::from_secs(30),
                     self.connection.accept_uni(),
                 )
@@ -157,39 +157,15 @@ impl QsftpClient {
                     let _ = tokio::fs::create_dir_all(parent).await;
                 }
 
+                let chunk = crate::protocol::dynamic_chunk_size(size);
+                let mut buffered_recv = tokio::io::BufReader::with_capacity(chunk, uni_recv);
                 let mut file = tokio::io::BufWriter::with_capacity(
-                    CHUNK_SIZE,
+                    chunk,
                     tokio::fs::File::create(local_path).await?,
                 );
-                let mut received = 0u64;
-                let mut buf = vec![0u8; CHUNK_SIZE];
                 let start = std::time::Instant::now();
-                let mut last_report = start;
 
-                while received < size {
-                    let to_read = std::cmp::min((size - received) as usize, CHUNK_SIZE);
-                    let n = match uni_recv.read(&mut buf[..to_read]).await? {
-                        Some(n) => n,
-                        None => break,
-                    };
-                    file.write_all(&buf[..n]).await?;
-                    received += n as u64;
-
-                    let now = std::time::Instant::now();
-                    if now.duration_since(last_report).as_millis() > 500 {
-                        let elapsed = now.duration_since(start).as_secs_f64();
-                        let speed = received as f64 / elapsed / 1024.0 / 1024.0;
-                        let pct = (received as f64 / size as f64 * 100.0) as u32;
-                        eprint!(
-                            "\r  {}% ({}/{} bytes) {:.1} MiB/s",
-                            pct,
-                            format_size(received),
-                            format_size(size),
-                            speed
-                        );
-                        last_report = now;
-                    }
-                }
+                let received = tokio::io::copy_buf(&mut buffered_recv, &mut file).await?;
                 file.flush().await?;
 
                 let elapsed = start.elapsed().as_secs_f64();
@@ -234,38 +210,14 @@ impl QsftpClient {
                 // Send file data on uni stream
                 let mut uni_send = self.connection.open_uni().await?;
 
+                let chunk = crate::protocol::dynamic_chunk_size(size);
                 let mut file = tokio::io::BufReader::with_capacity(
-                    CHUNK_SIZE,
+                    chunk,
                     tokio::fs::File::open(local_path).await?,
                 );
-                let mut sent = 0u64;
-                let mut buf = vec![0u8; CHUNK_SIZE];
                 let start = std::time::Instant::now();
-                let mut last_report = start;
 
-                loop {
-                    let n = file.read(&mut buf).await?;
-                    if n == 0 {
-                        break;
-                    }
-                    uni_send.write_all(&buf[..n]).await?;
-                    sent += n as u64;
-
-                    let now = std::time::Instant::now();
-                    if now.duration_since(last_report).as_millis() > 500 {
-                        let elapsed = now.duration_since(start).as_secs_f64();
-                        let speed = sent as f64 / elapsed / 1024.0 / 1024.0;
-                        let pct = (sent as f64 / size as f64 * 100.0) as u32;
-                        eprint!(
-                            "\r  {}% ({}/{} bytes) {:.1} MiB/s",
-                            pct,
-                            format_size(sent),
-                            format_size(size),
-                            speed
-                        );
-                        last_report = now;
-                    }
-                }
+                let sent = tokio::io::copy_buf(&mut file, &mut uni_send).await?;
                 uni_send.finish()?;
 
                 // Wait for server confirmation

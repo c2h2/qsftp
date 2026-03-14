@@ -427,24 +427,17 @@ async fn handle_command(
             match tokio::fs::metadata(&resolved).await {
                 Ok(meta) => {
                     let size = meta.len();
+                    let chunk = crate::protocol::dynamic_chunk_size(size);
                     write_msg(&mut send, &Response::FileData { size }).await?;
 
                     // Send file data on a new uni stream
                     let mut uni_send = connection.open_uni().await?;
 
                     let mut file = tokio::io::BufReader::with_capacity(
-                        CHUNK_SIZE,
+                        chunk,
                         tokio::fs::File::open(&resolved).await?,
                     );
-                    let mut buf = vec![0u8; CHUNK_SIZE];
-                    loop {
-                        use tokio::io::AsyncReadExt;
-                        let n = file.read(&mut buf).await?;
-                        if n == 0 {
-                            break;
-                        }
-                        uni_send.write_all(&buf[..n]).await?;
-                    }
+                    tokio::io::copy_buf(&mut file, &mut uni_send).await?;
                     uni_send.finish()?;
                 }
                 Err(e) => {
@@ -469,26 +462,17 @@ async fn handle_command(
                 let _ = tokio::fs::create_dir_all(parent).await;
             }
 
+            let chunk = crate::protocol::dynamic_chunk_size(size);
             write_msg(&mut send, &Response::Ok).await?;
 
             // Receive file data on a uni stream
-            let mut uni_recv = connection.accept_uni().await?;
+            let uni_recv = connection.accept_uni().await?;
+            let mut buffered_recv = tokio::io::BufReader::with_capacity(chunk, uni_recv);
             let mut file = tokio::io::BufWriter::with_capacity(
-                CHUNK_SIZE,
+                chunk,
                 tokio::fs::File::create(&resolved).await?,
             );
-            let mut remaining = size;
-            let mut buf = vec![0u8; CHUNK_SIZE];
-            while remaining > 0 {
-                let to_read = std::cmp::min(remaining as usize, CHUNK_SIZE);
-                match uni_recv.read(&mut buf[..to_read]).await? {
-                    Some(n) => {
-                        file.write_all(&buf[..n]).await?;
-                        remaining -= n as u64;
-                    }
-                    None => break,
-                }
-            }
+            tokio::io::copy_buf(&mut buffered_recv, &mut file).await?;
             file.flush().await?;
             drop(file);
 

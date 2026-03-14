@@ -3,8 +3,27 @@ use anyhow::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub const DEFAULT_PORT: u16 = 1022;
-pub const CHUNK_SIZE: usize = 256 * 1024; // 256 KiB
 pub const ALPN_QSFTP: &[u8] = b"qsftp/1";
+
+const MIN_CHUNK: usize = 256 * 1024;      // 256 KiB
+const MAX_CHUNK: usize = 16 * 1024 * 1024; // 16 MiB
+
+/// Choose chunk/buffer size based on file size:
+///   < 1 MiB   → 256 KiB
+///   < 16 MiB  → 1 MiB
+///   < 256 MiB → 4 MiB
+///   >= 256 MiB → 16 MiB
+pub fn dynamic_chunk_size(file_size: u64) -> usize {
+    if file_size < 1024 * 1024 {
+        MIN_CHUNK
+    } else if file_size < 16 * 1024 * 1024 {
+        1024 * 1024
+    } else if file_size < 256 * 1024 * 1024 {
+        4 * 1024 * 1024
+    } else {
+        MAX_CHUNK
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Request {
