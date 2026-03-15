@@ -217,6 +217,58 @@ where
     Ok((read_res??, writer))
 }
 
+/// Like `pipe_chunks` but updates an atomic progress counter as bytes are read.
+pub async fn pipe_chunks_progress<R, W>(
+    mut reader: R,
+    mut writer: W,
+    chunk_size: usize,
+    queue_depth: usize,
+    progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) -> Result<(u64, W)>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(queue_depth);
+
+    let reader_task = tokio::spawn(async move {
+        let mut total = 0u64;
+        loop {
+            let mut buf = vec![0u8; chunk_size];
+            let mut filled = 0usize;
+            while filled < chunk_size {
+                match reader.read(&mut buf[filled..]).await {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(e) => return Err(anyhow::anyhow!(e)),
+                }
+            }
+            if filled == 0 {
+                break;
+            }
+            buf.truncate(filled);
+            total += filled as u64;
+            progress.store(total, std::sync::atomic::Ordering::Relaxed);
+            if tx.send(bytes::Bytes::from(buf)).await.is_err() {
+                break;
+            }
+        }
+        Ok::<u64, anyhow::Error>(total)
+    });
+
+    let writer_task = tokio::spawn(async move {
+        while let Some(chunk) = rx.recv().await {
+            writer.write_all(&chunk).await?;
+        }
+        writer.flush().await?;
+        Ok::<W, anyhow::Error>(writer)
+    });
+
+    let (read_res, write_res) = tokio::join!(reader_task, writer_task);
+    let writer = write_res??;
+    Ok((read_res??, writer))
+}
+
 /// Like `pipe_chunks` but compresses each chunk with zstd before writing.
 /// Returns `(uncompressed_bytes, compressed_bytes, writer)`.
 pub async fn pipe_chunks_compress<R, W>(
@@ -254,6 +306,67 @@ where
             })
             .await??;
             // Frame: 4-byte little-endian length prefix + compressed data
+            let mut framed = Vec::with_capacity(4 + compressed.len());
+            framed.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+            framed.extend_from_slice(&compressed);
+            if tx.send(bytes::Bytes::from(framed)).await.is_err() {
+                break;
+            }
+        }
+        Ok::<u64, anyhow::Error>(raw_total)
+    });
+
+    let writer_task = tokio::spawn(async move {
+        let mut compressed_total = 0u64;
+        while let Some(chunk) = rx.recv().await {
+            compressed_total += chunk.len() as u64;
+            writer.write_all(&chunk).await?;
+        }
+        writer.flush().await?;
+        Ok::<(u64, W), anyhow::Error>((compressed_total, writer))
+    });
+
+    let (read_res, write_res) = tokio::join!(reader_task, writer_task);
+    let (compressed_total, writer) = write_res??;
+    Ok((read_res??, compressed_total, writer))
+}
+
+/// Like `pipe_chunks_compress` but updates an atomic progress counter as bytes are read.
+pub async fn pipe_chunks_compress_progress<R, W>(
+    mut reader: R,
+    mut writer: W,
+    chunk_size: usize,
+    queue_depth: usize,
+    progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) -> Result<(u64, u64, W)>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(queue_depth);
+
+    let reader_task = tokio::spawn(async move {
+        let mut raw_total = 0u64;
+        loop {
+            let mut buf = vec![0u8; chunk_size];
+            let mut filled = 0usize;
+            while filled < chunk_size {
+                match reader.read(&mut buf[filled..]).await {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(e) => return Err(anyhow::anyhow!(e)),
+                }
+            }
+            if filled == 0 {
+                break;
+            }
+            buf.truncate(filled);
+            raw_total += filled as u64;
+            progress.store(raw_total, std::sync::atomic::Ordering::Relaxed);
+            let compressed = tokio::task::spawn_blocking(move || {
+                zstd::encode_all(buf.as_slice(), ZSTD_LEVEL)
+            })
+            .await??;
             let mut framed = Vec::with_capacity(4 + compressed.len());
             framed.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
             framed.extend_from_slice(&compressed);

@@ -271,11 +271,30 @@ impl QsftpClient {
                 let file = tokio::fs::File::open(local_path).await?;
                 let start = std::time::Instant::now();
 
+                let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let progress2 = progress.clone();
+
+                // Progress reporter task
+                let progress_task = tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+                    interval.tick().await; // skip immediate first tick
+                    loop {
+                        interval.tick().await;
+                        let done = progress2.load(std::sync::atomic::Ordering::Relaxed);
+                        if done == u64::MAX { break; }
+                        let elapsed = start.elapsed().as_secs_f64();
+                        let speed = if elapsed > 0.0 { done as f64 / elapsed / 1024.0 / 1024.0 } else { 0.0 };
+                        let pct = if size > 0 { done * 100 / size } else { 0 };
+                        eprint!("\r  {}% {} / {} ({:.1} MiB/s)    ",
+                            pct, format_size(done), format_size(size), speed);
+                    }
+                });
+
                 let (sent, mut uni_send) = if compress {
-                    let (raw, _comp, w) = crate::protocol::pipe_chunks_compress(file, uni_send, chunk, 8).await?;
+                    let (raw, _comp, w) = crate::protocol::pipe_chunks_compress_progress(file, uni_send, chunk, 8, progress).await?;
                     (raw, w)
                 } else {
-                    crate::protocol::pipe_chunks(file, uni_send, chunk, 8).await?
+                    crate::protocol::pipe_chunks_progress(file, uni_send, chunk, 8, progress).await?
                 };
                 uni_send.finish()?;
 
@@ -293,8 +312,10 @@ impl QsftpClient {
 
                 let elapsed = start.elapsed().as_secs_f64();
                 let speed = sent as f64 / elapsed / 1024.0 / 1024.0;
+                // Signal progress task to stop, then print final line
+                progress_task.abort();
                 eprintln!(
-                    "\r  100% {} transferred in {:.1}s ({:.1} MiB/s)       ",
+                    "\r  100% {} in {:.1}s ({:.1} MiB/s)       ",
                     format_size(sent),
                     elapsed,
                     speed
