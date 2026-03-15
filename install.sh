@@ -205,7 +205,14 @@ WantedBy=multi-user.target
         sudo ufw allow "${DEFAULT_PORT}/udp" > /dev/null 2>&1 && ok "Firewall rule added (${DEFAULT_PORT}/udp)" || warn "Could not add firewall rule"
     fi
 
-    # Reload systemd
+    # Stop any old qsftp service (previous name before rename)
+    if sudo systemctl is-active --quiet qsftp 2>/dev/null; then
+        info "Stopping old qsftp service..."
+        sudo systemctl stop qsftp 2>/dev/null || true
+        sudo systemctl disable qsftp 2>/dev/null || true
+    fi
+
+    # Reload systemd and restart qsshd
     if [ -w "/etc/systemd/system" ]; then
         systemctl daemon-reload
         systemctl enable qsshd
@@ -215,8 +222,7 @@ WantedBy=multi-user.target
         sudo systemctl enable qsshd
         sudo systemctl restart qsshd
     fi
-    ok "Systemd daemon reloaded"
-    ok "Service enabled and started"
+    ok "Service restarted (qsshd)"
 }
 
 main "$@"
