@@ -9,20 +9,51 @@ use crate::auth;
 use crate::protocol::*;
 
 
+/// Try to enlarge SO_SNDBUF / SO_RCVBUF on a UDP socket.
+/// Failures are silently ignored — the OS will use whatever it allows.
+fn set_socket_buf(sock: &std::net::UdpSocket, size: usize) {
+    use std::os::unix::io::AsRawFd;
+    let fd = sock.as_raw_fd();
+    let sz = size as libc::c_int;
+    unsafe {
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF,
+            &sz as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF,
+            &sz as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+    }
+}
+
 pub async fn run_server(
     listen_addrs: &[SocketAddr],
     server_config: quinn::ServerConfig,
     no_auth: bool,
 ) -> Result<()> {
+    const SOCK_BUF: usize = 4 * 1024 * 1024; // 4 MiB
+
     let mut endpoints = Vec::new();
     for addr in listen_addrs {
-        match Endpoint::server(server_config.clone(), *addr) {
+        let udp_sock = match std::net::UdpSocket::bind(addr) {
+            Ok(s) => s,
+            Err(e) => { warn!("Failed to bind {}: {}", addr, e); continue; }
+        };
+        set_socket_buf(&udp_sock, SOCK_BUF);
+        udp_sock.set_nonblocking(true)?;
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| anyhow::anyhow!("no async runtime"))?;
+        match Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(server_config.clone()),
+            udp_sock,
+            runtime,
+        ) {
             Ok(ep) => {
                 info!("QSFTP server listening on {} (no_auth={})", addr, no_auth);
                 endpoints.push(ep);
             }
             Err(e) => {
-                warn!("Failed to bind {}: {}", addr, e);
+                warn!("Failed to create endpoint on {}: {}", addr, e);
             }
         }
     }

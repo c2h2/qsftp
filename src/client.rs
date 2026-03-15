@@ -64,7 +64,24 @@ impl QsftpClient {
         } else {
             "0.0.0.0:0".parse()?
         };
-        let mut endpoint = Endpoint::client(bind_addr)?;
+
+        // Enlarge OS UDP socket buffers before handing the socket to Quinn.
+        // macOS defaults to ~9 KB send buffer which causes ENOBUFS under load.
+        // We request 4 MiB; the OS will silently cap it at the system maximum
+        // (typically 4–7 MiB on macOS, up to kern.ipc.maxsockbuf).
+        let udp_sock = std::net::UdpSocket::bind(bind_addr)?;
+        const SOCK_BUF: usize = 4 * 1024 * 1024; // 4 MiB
+        set_socket_buf(&udp_sock, SOCK_BUF);
+        udp_sock.set_nonblocking(true)?;
+
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| anyhow::anyhow!("no async runtime"))?;
+        let mut endpoint = Endpoint::new(
+            quinn::EndpointConfig::default(),
+            None,
+            udp_sock,
+            runtime,
+        )?;
         endpoint.set_default_client_config(client_config);
 
         tracing::debug!("Connecting to {} (SNI: {})...", server_addr, server_name);
@@ -331,6 +348,22 @@ impl QsftpClient {
                 anyhow::bail!("Unexpected response");
             }
         }
+    }
+}
+
+/// Try to set SO_SNDBUF and SO_RCVBUF on a UDP socket.
+/// Failures are ignored — the OS will just use whatever it allows.
+fn set_socket_buf(sock: &std::net::UdpSocket, size: usize) {
+    use std::os::unix::io::AsRawFd;
+    let fd = sock.as_raw_fd();
+    let sz = size as libc::c_int;
+    unsafe {
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF,
+            &sz as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+        libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF,
+            &sz as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t);
     }
 }
 

@@ -66,9 +66,11 @@ pub fn build_server_config(
     let mut transport = quinn::TransportConfig::default();
     transport.max_concurrent_bidi_streams(128u32.into());
     transport.max_concurrent_uni_streams(128u32.into());
-    transport.stream_receive_window(33_554_432u32.into()); // 32 MiB
-    transport.receive_window(67_108_864u32.into());        // 64 MiB
-    transport.send_window(67_108_864u64);                  // 64 MiB
+    // Flow-control windows: keep them well below the 4 MiB OS socket buffer
+    // so Quinn never tries to burst more data than the kernel can queue.
+    transport.stream_receive_window(4_194_304u32.into());  // 4 MiB per stream
+    transport.receive_window(8_388_608u32.into());         // 8 MiB per connection
+    transport.send_window(4_194_304u64);                   // 4 MiB send window
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
     transport.max_idle_timeout(Some(
         std::time::Duration::from_secs(300).try_into().expect("idle timeout"),
@@ -143,9 +145,9 @@ pub fn build_client_config() -> Result<quinn::ClientConfig> {
     let mut transport = quinn::TransportConfig::default();
     transport.max_concurrent_bidi_streams(128u32.into());
     transport.max_concurrent_uni_streams(128u32.into());
-    transport.stream_receive_window(33_554_432u32.into()); // 32 MiB
-    transport.receive_window(67_108_864u32.into());        // 64 MiB
-    transport.send_window(67_108_864u64);                  // 64 MiB
+    transport.stream_receive_window(4_194_304u32.into());  // 4 MiB per stream
+    transport.receive_window(8_388_608u32.into());         // 8 MiB per connection
+    transport.send_window(4_194_304u64);                   // 4 MiB send window
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
     transport.max_idle_timeout(Some(
         std::time::Duration::from_secs(300).try_into().expect("idle timeout"),
