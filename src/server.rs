@@ -272,7 +272,10 @@ async fn handle_command(
 
     match req {
         Request::Caps => {
-            let caps = crate::protocol::ServerCaps { zstd: true };
+            let caps = crate::protocol::ServerCaps {
+                zstd: true,
+                version: env!("GIT_VERSION").to_string(),
+            };
             write_msg(&mut send, &Response::CapsOk { caps }).await?;
         }
         Request::Ls { path } => {

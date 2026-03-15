@@ -57,8 +57,11 @@ async fn main() -> Result<()> {
             // Download
             let addr = resolve_host(host, args.port).await?;
             let client = connect_and_auth(addr, user, host, args.identity.as_deref(), &args.password).await?;
+            if !client.server_version.is_empty() {
+                eprintln!("  Server     : {}", client.server_version);
+            }
             eprintln!("  Encryption : QUIC/TLS 1.3  cipher={}", client.tls_cipher);
-            eprintln!("  Compression: {}", if client.compress { "zstd (on)" } else { "none (old server)" });
+            eprintln!("  Compression: {}", compression_label(&client));
 
             let local = PathBuf::from(local_path);
             if args.recursive {
@@ -72,8 +75,11 @@ async fn main() -> Result<()> {
             // Upload
             let addr = resolve_host(host, args.port).await?;
             let client = connect_and_auth(addr, user, host, args.identity.as_deref(), &args.password).await?;
+            if !client.server_version.is_empty() {
+                eprintln!("  Server     : {}", client.server_version);
+            }
             eprintln!("  Encryption : QUIC/TLS 1.3  cipher={}", client.tls_cipher);
-            eprintln!("  Compression: {}", if client.compress { "zstd (on)" } else { "none (old server)" });
+            eprintln!("  Compression: {}", compression_label(&client));
 
             let local = PathBuf::from(local_path);
             if args.recursive {
@@ -188,6 +194,16 @@ async fn connect_and_auth(
     let pw = get_password(password, user, host)?;
     let (connection2, _endpoint2) = QsftpClient::connect(addr, "localhost").await?;
     QsftpClient::authenticate(connection2, user, &pw).await
+}
+
+fn compression_label(client: &QsftpClient) -> &'static str {
+    if client.compress {
+        "zstd (on)"
+    } else if client.caps_negotiated {
+        "none"
+    } else {
+        "none (old server)"
+    }
 }
 
 fn get_password(provided: &Option<String>, user: &str, host: &str) -> Result<String> {

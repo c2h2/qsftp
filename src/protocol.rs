@@ -33,6 +33,9 @@ pub fn dynamic_chunk_size(file_size: u64) -> usize {
 pub struct ServerCaps {
     /// Server supports zstd per-transfer compression
     pub zstd: bool,
+    /// Server version string (e.g. "dc34306" or "1.2.3")
+    #[serde(default)]
+    pub version: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

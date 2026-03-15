@@ -82,8 +82,18 @@ async fn main() -> Result<()> {
     };
 
     eprintln!("Connected to {}. Home: {}", host, client.home_dir);
+    if !client.server_version.is_empty() {
+        eprintln!("  Server     : {}", client.server_version);
+    }
     eprintln!("  Encryption : QUIC/TLS 1.3  cipher={}", client.tls_cipher);
-    eprintln!("  Compression: {}", if client.compress { "zstd (on)" } else { "none (old server)" });
+    let compress_label = if client.compress {
+        "zstd (on)"
+    } else if client.caps_negotiated {
+        "none"
+    } else {
+        "none (old server)"
+    };
+    eprintln!("  Compression: {}", compress_label);
     eprintln!("Type 'help' for available commands.");
 
     run_interactive(&client).await?;

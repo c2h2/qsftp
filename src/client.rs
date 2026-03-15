@@ -13,6 +13,10 @@ pub struct QsftpClient {
     pub compress: bool,
     /// TLS cipher suite negotiated for this connection
     pub tls_cipher: String,
+    /// Remote server version string; empty if server is too old to report it
+    pub server_version: String,
+    /// True if the server responded to the Caps request (i.e. is not an old server)
+    pub caps_negotiated: bool,
 }
 
 /// Extract TLS info from a quinn connection.
@@ -31,20 +35,21 @@ fn tls_cipher_name(conn: &quinn::Connection) -> String {
 /// Query server capabilities after auth. Old servers that don't recognise
 /// the Caps request will return an Error — we catch that and return default
 /// (no) capabilities so the client degrades gracefully.
-async fn negotiate_caps(connection: &quinn::Connection) -> crate::protocol::ServerCaps {
-    let result: anyhow::Result<crate::protocol::ServerCaps> = async {
+/// Returns `(caps, negotiated)` where `negotiated` is false for old servers.
+async fn negotiate_caps(connection: &quinn::Connection) -> (crate::protocol::ServerCaps, bool) {
+    let result: anyhow::Result<(crate::protocol::ServerCaps, bool)> = async {
         let (mut send, mut recv) = connection.open_bi().await?;
         write_msg(&mut send, &Request::Caps).await?;
         send.finish()?;
         let resp: Response = read_msg(&mut recv).await?;
         match resp {
-            Response::CapsOk { caps } => Ok(caps),
+            Response::CapsOk { caps } => Ok((caps, true)),
             // Old server returns Error — treat as no caps
-            Response::Error { .. } => Ok(crate::protocol::ServerCaps::default()),
-            _ => Ok(crate::protocol::ServerCaps::default()),
+            Response::Error { .. } => Ok((crate::protocol::ServerCaps::default(), false)),
+            _ => Ok((crate::protocol::ServerCaps::default(), false)),
         }
     }.await;
-    result.unwrap_or_default()
+    result.unwrap_or((crate::protocol::ServerCaps::default(), false))
 }
 
 impl QsftpClient {
@@ -88,13 +93,15 @@ impl QsftpClient {
                 let remote_cwd = home_dir.clone();
                 send.finish()?;
                 let tls_cipher = tls_cipher_name(&connection);
-                let caps = negotiate_caps(&connection).await;
+                let (caps, caps_negotiated) = negotiate_caps(&connection).await;
                 Ok(Self {
                     connection,
                     home_dir,
                     remote_cwd,
                     compress: caps.zstd,
                     tls_cipher,
+                    server_version: caps.version,
+                    caps_negotiated,
                 })
             }
             Response::Error { message } => {
@@ -145,13 +152,15 @@ impl QsftpClient {
                         let remote_cwd = home_dir.clone();
                         send.finish()?;
                         let tls_cipher = tls_cipher_name(&connection);
-                        let caps = negotiate_caps(&connection).await;
+                        let (caps, caps_negotiated) = negotiate_caps(&connection).await;
                         Ok(Self {
                             connection,
                             home_dir,
                             remote_cwd,
                             compress: caps.zstd,
                             tls_cipher,
+                            server_version: caps.version,
+                            caps_negotiated,
                         })
                     }
                     Response::Error { message } => {
