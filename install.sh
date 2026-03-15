@@ -212,6 +212,11 @@ WantedBy=multi-user.target
         sudo systemctl disable qsftp 2>/dev/null || true
     fi
 
+    # Kill any lingering qsshd processes that systemctl may have left behind
+    sudo pkill -x qsshd 2>/dev/null || true
+    # Give the OS a moment to release the UDP port before we re-bind
+    sleep 1
+
     # Reload systemd and restart qsshd
     if [ -w "/etc/systemd/system" ]; then
         systemctl daemon-reload
