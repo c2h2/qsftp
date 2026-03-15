@@ -10,7 +10,7 @@ set -euo pipefail
 
 VERSION="v$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')"
 OUTDIR="./to_github"
-BINARIES="qsftp-server qsftp qscp"
+BINARIES="qsshd qsftp qscp qssh"
 HOST_OS="$(uname -s)"
 HOST_ARCH="$(uname -m)"
 

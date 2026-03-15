@@ -3,9 +3,9 @@
 set -euo pipefail
 
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
-BINARIES="qsftp-server qsftp qscp"
+BINARIES="qsshd qsftp qscp qssh"
 DEFAULT_PORT=1022
-SERVICE_NAME="qsftp-server"
+SERVICE_NAME="qsshd"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
 echo "==> Building qsftp (release)..."
@@ -28,12 +28,12 @@ echo "==> Done. Installed: $(echo $BINARIES | tr ' ' ',')"
 echo "==> Installing systemd service..."
 sudo tee "$SERVICE_FILE" > /dev/null <<EOF
 [Unit]
-Description=QSFTP Server - SFTP/SCP over QUIC (UDP)
+Description=QSFTP Server - SFTP/SCP/SSH over QUIC (UDP)
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=${INSTALL_DIR}/qsftp-server --listen 0.0.0.0:${DEFAULT_PORT}
+ExecStart=${INSTALL_DIR}/qsshd --listen 0.0.0.0:${DEFAULT_PORT}
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536
