@@ -30,6 +30,14 @@ struct Args {
     #[arg(long, env = "QSFTP_PASSWORD", hide = true)]
     password: Option<String>,
 
+    /// Wire transport: "quic" (default) or "veil" (obfuscated UDP).
+    #[arg(long, default_value = "quic")]
+    protocol: qsftp::transport::Protocol,
+
+    /// Shared passphrase for the VEIL transport (required when --protocol veil).
+    #[arg(long, env = "QSSH_PROTOCOL_KEY", hide_env_values = true)]
+    protocol_key: Option<String>,
+
     /// Verbose/debug output (like ssh -v)
     #[arg(short = 'v', long)]
     verbose: bool,
@@ -56,7 +64,9 @@ async fn main() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Could not resolve host: {}", host))?;
     tracing::debug!("Resolved to {}", addr);
 
-    let (connection, _endpoint) = QsftpClient::connect(addr, "localhost").await?;
+    let (connection, _endpoint) =
+        QsftpClient::connect_proto(addr, "localhost", args.protocol, args.protocol_key.as_deref())
+            .await?;
 
     // Try SSH key auth first, fall back to password
     let client = match try_key_auth(&connection, &username, args.identity.as_deref()).await {
@@ -76,7 +86,13 @@ async fn main() -> Result<()> {
                 )))?
             };
             // Need a new connection since the old auth stream may be consumed
-            let (connection2, _endpoint2) = QsftpClient::connect(addr, "localhost").await?;
+            let (connection2, _endpoint2) = QsftpClient::connect_proto(
+                addr,
+                "localhost",
+                args.protocol,
+                args.protocol_key.as_deref(),
+            )
+            .await?;
             QsftpClient::authenticate(connection2, &username, &password).await?
         }
     };
@@ -102,7 +118,7 @@ async fn main() -> Result<()> {
 }
 
 async fn try_key_auth(
-    connection: &quinn::Connection,
+    connection: &qsftp::transport::Conn,
     username: &str,
     identity_file: Option<&Path>,
 ) -> Result<QsftpClient> {

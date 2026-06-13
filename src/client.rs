@@ -4,9 +4,11 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 use crate::protocol::*;
+use crate::transport::{Conn, Protocol};
+use crate::veil::VeilKey;
 
 pub struct QsftpClient {
-    pub connection: quinn::Connection,
+    pub connection: Conn,
     pub home_dir: String,
     pub remote_cwd: String,
     /// Whether the server supports (and we will use) zstd compression
@@ -26,21 +28,27 @@ pub struct QsftpClient {
 /// Extract TLS info from a quinn connection.
 /// QUIC mandates TLS 1.3; quinn with rustls uses AES-128-GCM-SHA256 or
 /// CHACHA20-POLY1305-SHA256. We report what we can from handshake data.
-fn tls_cipher_name(conn: &quinn::Connection) -> String {
-    let alpn = conn.handshake_data()
-        .and_then(|d| d.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
-        .and_then(|d| d.protocol)
-        .map(|p| String::from_utf8_lossy(&p).to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    // QUIC always uses TLS 1.3; rustls defaults to AES-128-GCM-SHA256
-    format!("TLS_AES_128_GCM_SHA256 (TLS 1.3, ALPN={})", alpn)
+fn tls_cipher_name(conn: &Conn) -> String {
+    match conn {
+        Conn::Quic(c) => {
+            let alpn = c
+                .handshake_data()
+                .and_then(|d| d.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+                .and_then(|d| d.protocol)
+                .map(|p| String::from_utf8_lossy(&p).to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            format!("TLS_AES_128_GCM_SHA256 (TLS 1.3, ALPN={})", alpn)
+        }
+        // VEIL has no TLS; it's a single AEAD suite over an opaque UDP transport.
+        Conn::Veil(_) => "VEIL (ChaCha20-Poly1305, obfuscated UDP)".to_string(),
+    }
 }
 
 /// Query server capabilities after auth. Old servers that don't recognise
 /// the Caps request will return an Error — we catch that and return default
 /// (no) capabilities so the client degrades gracefully.
 /// Returns `(caps, negotiated)` where `negotiated` is false for old servers.
-async fn negotiate_caps(connection: &quinn::Connection) -> (crate::protocol::ServerCaps, bool) {
+async fn negotiate_caps(connection: &Conn) -> (crate::protocol::ServerCaps, bool) {
     let result: anyhow::Result<(crate::protocol::ServerCaps, bool)> = async {
         let (mut send, mut recv) = connection.open_bi().await?;
         write_msg(&mut send, &Request::Caps).await?;
@@ -57,46 +65,63 @@ async fn negotiate_caps(connection: &quinn::Connection) -> (crate::protocol::Ser
 }
 
 impl QsftpClient {
+    /// Connect over QUIC (default). Returns the connection and the owning
+    /// endpoint (kept alive by the caller).
     pub async fn connect(
         server_addr: SocketAddr,
         server_name: &str,
-    ) -> Result<(quinn::Connection, Endpoint)> {
-        let client_config = crate::cert::build_client_config()?;
+    ) -> Result<(Conn, Option<Endpoint>)> {
+        Self::connect_proto(server_addr, server_name, Protocol::Quic, None).await
+    }
 
-        let bind_addr: SocketAddr = if server_addr.is_ipv6() {
-            "[::]:0".parse()?
-        } else {
-            "0.0.0.0:0".parse()?
-        };
+    /// Connect using the chosen transport. For `Protocol::Veil`, `key` must be
+    /// the shared obfuscation passphrase (the connection is opaque without it).
+    pub async fn connect_proto(
+        server_addr: SocketAddr,
+        server_name: &str,
+        protocol: Protocol,
+        key: Option<&str>,
+    ) -> Result<(Conn, Option<Endpoint>)> {
+        match protocol {
+            Protocol::Veil => {
+                let pass = key.ok_or_else(|| {
+                    anyhow::anyhow!("VEIL transport requires --protocol-key (shared passphrase)")
+                })?;
+                tracing::debug!("Connecting to {} over VEIL...", server_addr);
+                let conn = crate::veil::connect(server_addr, VeilKey::from_passphrase(pass)).await?;
+                tracing::debug!("VEIL connection established to {}", server_addr);
+                Ok((Conn::Veil(conn), None))
+            }
+            Protocol::Quic => {
+                let client_config = crate::cert::build_client_config()?;
+                let bind_addr: SocketAddr = if server_addr.is_ipv6() {
+                    "[::]:0".parse()?
+                } else {
+                    "0.0.0.0:0".parse()?
+                };
+                // Enlarge OS UDP socket buffers before handing the socket to Quinn.
+                let udp_sock = std::net::UdpSocket::bind(bind_addr)?;
+                const SOCK_BUF: usize = 4 * 1024 * 1024;
+                set_socket_buf(&udp_sock, SOCK_BUF);
+                udp_sock.set_nonblocking(true)?;
 
-        // Enlarge OS UDP socket buffers before handing the socket to Quinn.
-        // macOS defaults to ~9 KB send buffer which causes ENOBUFS under load.
-        // We request 4 MiB; the OS will silently cap it at the system maximum
-        // (typically 4–7 MiB on macOS, up to kern.ipc.maxsockbuf).
-        let udp_sock = std::net::UdpSocket::bind(bind_addr)?;
-        const SOCK_BUF: usize = 4 * 1024 * 1024; // 4 MiB
-        set_socket_buf(&udp_sock, SOCK_BUF);
-        udp_sock.set_nonblocking(true)?;
+                let runtime = quinn::default_runtime()
+                    .ok_or_else(|| anyhow::anyhow!("no async runtime"))?;
+                let mut endpoint =
+                    Endpoint::new(quinn::EndpointConfig::default(), None, udp_sock, runtime)?;
+                endpoint.set_default_client_config(client_config);
 
-        let runtime = quinn::default_runtime()
-            .ok_or_else(|| anyhow::anyhow!("no async runtime"))?;
-        let mut endpoint = Endpoint::new(
-            quinn::EndpointConfig::default(),
-            None,
-            udp_sock,
-            runtime,
-        )?;
-        endpoint.set_default_client_config(client_config);
-
-        tracing::debug!("Connecting to {} (SNI: {})...", server_addr, server_name);
-        let connection = endpoint.connect(server_addr, server_name)?.await?;
-        tracing::debug!("QUIC connection established to {}", server_addr);
-        Ok((connection, endpoint))
+                tracing::debug!("Connecting to {} (SNI: {})...", server_addr, server_name);
+                let connection = endpoint.connect(server_addr, server_name)?.await?;
+                tracing::debug!("QUIC connection established to {}", server_addr);
+                Ok((Conn::Quic(connection), Some(endpoint)))
+            }
+        }
     }
 
     /// Password-based authentication
     pub async fn authenticate(
-        connection: quinn::Connection,
+        connection: Conn,
         username: &str,
         password: &str,
     ) -> Result<Self> {
@@ -138,7 +163,7 @@ impl QsftpClient {
 
     /// SSH key-based authentication (challenge-response)
     pub async fn authenticate_key(
-        connection: quinn::Connection,
+        connection: Conn,
         username: &str,
         private_key: &ssh_key::PrivateKey,
     ) -> Result<Self> {

@@ -42,6 +42,16 @@ struct Args {
     #[arg(short = 'N', long)]
     no_shell: bool,
 
+    /// Wire transport: "quic" (default) or "veil" (obfuscated UDP that's
+    /// indistinguishable from random — use when a middlebox filters QUIC).
+    #[arg(long, default_value = "quic")]
+    protocol: qsftp::transport::Protocol,
+
+    /// Shared passphrase for the VEIL transport (required when --protocol veil).
+    /// Must match the server's. Can be set via QSSH_PROTOCOL_KEY.
+    #[arg(long, env = "QSSH_PROTOCOL_KEY", hide_env_values = true)]
+    protocol_key: Option<String>,
+
     /// Verbose/debug output
     #[arg(short = 'v', long)]
     verbose: bool,
@@ -70,7 +80,16 @@ async fn main() -> Result<()> {
         .next()
         .ok_or_else(|| anyhow::anyhow!("Could not resolve host: {}", host))?;
 
-    let client = connect_and_auth(addr, &username, &host, args.identity.as_deref(), &args.password).await?;
+    let client = connect_and_auth(
+        addr,
+        &username,
+        &host,
+        args.identity.as_deref(),
+        &args.password,
+        args.protocol,
+        args.protocol_key.as_deref(),
+    )
+    .await?;
 
     eprintln!("Connected to {} ({})", host, client.tls_cipher);
 
@@ -148,8 +167,11 @@ async fn connect_and_auth(
     host: &str,
     identity: Option<&std::path::Path>,
     password: &Option<String>,
+    protocol: qsftp::transport::Protocol,
+    protocol_key: Option<&str>,
 ) -> Result<QsftpClient> {
-    let (connection, _endpoint) = QsftpClient::connect(addr, "localhost").await?;
+    let (connection, _endpoint) =
+        QsftpClient::connect_proto(addr, "localhost", protocol, protocol_key).await?;
 
     // Try SSH key auth first. Remember why it failed so we can report it clearly
     // if password auth is also unavailable.
@@ -189,7 +211,8 @@ async fn connect_and_auth(
         }
     };
     // A fresh connection is needed because a rejected auth closes the previous one.
-    let (conn2, _ep2) = QsftpClient::connect(addr, "localhost").await?;
+    let (conn2, _ep2) =
+        QsftpClient::connect_proto(addr, "localhost", protocol, protocol_key).await?;
     QsftpClient::authenticate(conn2, user, &pw)
         .await
         .map_err(|e| anyhow::anyhow!("Authentication failed: {}", e))
@@ -298,7 +321,7 @@ async fn run_exec(client: &QsftpClient, command: &str) -> Result<()> {
 // to the server asking it to connect to rhost:rport.
 
 async fn run_local_forward(
-    conn: quinn::Connection,
+    conn: qsftp::transport::Conn,
     bind: &str,
     lport: u16,
     rhost: &str,
@@ -385,7 +408,7 @@ async fn run_local_forward(
 // The server bind is done via Request::RemoteForwardBind.
 
 async fn run_remote_forward(
-    conn: quinn::Connection,
+    conn: qsftp::transport::Conn,
     bind: &str,
     rport: u16,
     lhost: &str,

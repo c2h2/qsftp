@@ -225,6 +225,33 @@ sudo ufw allow 1022/udp
 sudo iptables -A INPUT -p udp --dport 1022 -j ACCEPT
 ```
 
+## VEIL — obfuscated transport (when QUIC is filtered)
+
+Some ISPs and middleboxes recognise and drop QUIC (its first packet has a
+cleartext header and version field). **VEIL** is an alternative transport whose
+every datagram — from the first byte — is ChaCha20-Poly1305 ciphertext under a
+pre-shared passphrase. There is no cleartext header, no version, no handshake
+fingerprint: on the wire it is indistinguishable from random data, so DPI has
+nothing to classify or filter.
+
+Select it with `--protocol veil` on **both** ends and share a passphrase via
+`--protocol-key` (or the `QSSH_PROTOCOL_KEY` environment variable):
+
+```sh
+# Server
+QSSH_PROTOCOL_KEY='your-shared-passphrase' \
+  qsshd --protocol veil --listen 0.0.0.0:1022
+
+# Client — SOCKS tunnel over the obfuscated transport
+QSSH_PROTOCOL_KEY='your-shared-passphrase' \
+  qssh --protocol veil -N -L 1188:localhost:1180 user@host -p 1022
+```
+
+`--protocol quic` (the default) is interoperable and faster; `--protocol veil`
+trades a little throughput for being unfilterable. The passphrase is also the
+only thing that lets the server accept your packets — a wrong key is silently
+dropped, so the listener is invisible to anyone without it.
+
 ## Resilient tunnels
 
 The [`qtunnel`](qtunnel) helper keeps a `qssh -N` forward alive across drops,

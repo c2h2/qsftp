@@ -1,5 +1,5 @@
 use anyhow::Result;
-use quinn::{Connection, Endpoint};
+use quinn::Endpoint;
 use std::net::SocketAddr;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -7,6 +7,8 @@ use tracing::{error, info, warn};
 
 use crate::auth;
 use crate::protocol::*;
+use crate::transport::Conn;
+use crate::transport::Protocol;
 
 
 /// Try to enlarge SO_SNDBUF / SO_RCVBUF on a UDP socket.
@@ -25,6 +27,7 @@ fn set_socket_buf(sock: &std::net::UdpSocket, size: usize) {
     }
 }
 
+/// Run the server over QUIC (the default transport).
 pub async fn run_server(
     listen_addrs: &[SocketAddr],
     server_config: quinn::ServerConfig,
@@ -49,7 +52,7 @@ pub async fn run_server(
             runtime,
         ) {
             Ok(ep) => {
-                info!("QSFTP server listening on {} (no_auth={})", addr, no_auth);
+                info!("QSFTP server listening on {} (quic, no_auth={})", addr, no_auth);
                 endpoints.push(ep);
             }
             Err(e) => {
@@ -67,8 +70,13 @@ pub async fn run_server(
         set.spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(incoming, no_auth).await {
-                        error!("Connection error: {}", e);
+                    match incoming.await {
+                        Ok(c) => {
+                            if let Err(e) = handle_connection(Conn::Quic(c), no_auth).await {
+                                error!("Connection error: {}", e);
+                            }
+                        }
+                        Err(e) => error!("Handshake error: {}", e),
                     }
                 });
             }
@@ -79,6 +87,59 @@ pub async fn run_server(
     Ok(())
 }
 
+/// Run the server over VEIL (obfuscated UDP). `key` is the shared passphrase.
+pub async fn run_server_veil(
+    listen_addrs: &[SocketAddr],
+    passphrase: &str,
+    no_auth: bool,
+) -> Result<()> {
+    let veil_key = crate::veil::VeilKey::from_passphrase(passphrase);
+    let mut set = tokio::task::JoinSet::new();
+    let mut any = false;
+    for addr in listen_addrs {
+        match crate::veil::server(*addr, veil_key.clone()).await {
+            Ok(mut ep) => {
+                info!("QSFTP server listening on {} (veil, no_auth={})", addr, no_auth);
+                any = true;
+                set.spawn(async move {
+                    while let Some(conn) = ep.accept().await {
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_connection(Conn::Veil(conn), no_auth).await {
+                                error!("Connection error: {}", e);
+                            }
+                        });
+                    }
+                });
+            }
+            Err(e) => warn!("Failed to bind {} for VEIL: {}", addr, e),
+        }
+    }
+    if !any {
+        anyhow::bail!("Failed to bind any listen address");
+    }
+    set.join_next().await;
+    Ok(())
+}
+
+/// Dispatch to the right transport based on `protocol`.
+pub async fn run_server_proto(
+    listen_addrs: &[SocketAddr],
+    server_config: quinn::ServerConfig,
+    no_auth: bool,
+    protocol: Protocol,
+    veil_key: Option<&str>,
+) -> Result<()> {
+    match protocol {
+        Protocol::Quic => run_server(listen_addrs, server_config, no_auth).await,
+        Protocol::Veil => {
+            let key = veil_key.ok_or_else(|| {
+                anyhow::anyhow!("VEIL transport requires --protocol-key (shared passphrase)")
+            })?;
+            run_server_veil(listen_addrs, key, no_auth).await
+        }
+    }
+}
+
 /// Send a final auth-rejection error and make sure it is actually delivered
 /// before the stream/connection is dropped.
 ///
@@ -87,7 +148,7 @@ pub async fn run_server(
 /// is discarded — the client then sees "connection lost" instead of the real
 /// reason. Calling `finish()` + `stopped()` flushes the data and waits for the
 /// peer to acknowledge the FIN, so the message always reaches the client.
-async fn deny_auth(mut send: quinn::SendStream, message: &str) -> Result<()> {
+async fn deny_auth(mut send: crate::transport::SendStream, message: &str) -> Result<()> {
     write_msg(&mut send, &Response::Error { message: message.to_string() }).await?;
     // Best-effort: finish the stream and wait for the client to read it.
     let _ = send.finish();
@@ -95,8 +156,7 @@ async fn deny_auth(mut send: quinn::SendStream, message: &str) -> Result<()> {
     Ok(())
 }
 
-async fn handle_connection(incoming: quinn::Incoming, no_auth: bool) -> Result<()> {
-    let connection = incoming.await?;
+async fn handle_connection(connection: Conn, no_auth: bool) -> Result<()> {
     let remote = connection.remote_address();
     info!("New connection from {}", remote);
 
@@ -266,12 +326,8 @@ async fn handle_connection(incoming: quinn::Incoming, no_auth: bool) -> Result<(
     loop {
         let (send, recv) = match connection.accept_bi().await {
             Ok(streams) => streams,
-            Err(quinn::ConnectionError::ApplicationClosed(_)) => {
+            Err(_) => {
                 info!("Connection closed by {}", remote);
-                break;
-            }
-            Err(e) => {
-                error!("Stream accept error from {}: {}", remote, e);
                 break;
             }
         };
@@ -296,10 +352,10 @@ struct SessionState {
 }
 
 async fn handle_command(
-    mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
+    mut send: crate::transport::SendStream,
+    mut recv: crate::transport::RecvStream,
     session: std::sync::Arc<tokio::sync::Mutex<SessionState>>,
-    connection: Connection,
+    connection: Conn,
 ) -> Result<()> {
     let req: Request = read_msg(&mut recv).await?;
 
@@ -679,8 +735,8 @@ async fn handle_command(
 // ── Shell session ────────────────────────────────────────────────────────────
 
 async fn handle_shell(
-    mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
+    mut send: crate::transport::SendStream,
+    mut recv: crate::transport::RecvStream,
     home: &str,
     term: &str,
     cols: u16,
@@ -757,8 +813,8 @@ async fn handle_shell(
 // ── Remote port forward (-R) server side ────────────────────────────────────
 
 async fn handle_remote_forward_bind(
-    mut send: quinn::SendStream,
-    conn: Connection,
+    mut send: crate::transport::SendStream,
+    conn: Conn,
     bind: &str,
     port: u16,
 ) -> Result<()> {
@@ -855,8 +911,8 @@ fn open_pty(cols: u16, rows: u16) -> Result<(i32, i32)> {
 // ── Exec (non-interactive command) ──────────────────────────────────────────
 
 async fn handle_exec(
-    mut send: quinn::SendStream,
-    mut _recv: quinn::RecvStream,
+    mut send: crate::transport::SendStream,
+    mut _recv: crate::transport::RecvStream,
     home: &str,
     command: &str,
 ) -> Result<()> {
@@ -882,8 +938,8 @@ async fn handle_exec(
 // ── TCP port forwarding ──────────────────────────────────────────────────────
 
 async fn handle_tcp_forward(
-    mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
+    mut send: crate::transport::SendStream,
+    mut recv: crate::transport::RecvStream,
     host: &str,
     port: u16,
 ) -> Result<()> {

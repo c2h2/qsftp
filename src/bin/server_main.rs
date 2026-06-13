@@ -22,6 +22,16 @@ struct Args {
     #[arg(long)]
     no_auth: bool,
 
+    /// Wire transport: "quic" (default, interoperable) or "veil" (obfuscated,
+    /// indistinguishable-from-random UDP — use when a middlebox filters QUIC).
+    #[arg(long, default_value = "quic")]
+    protocol: qsftp::transport::Protocol,
+
+    /// Shared passphrase for the VEIL transport (required when --protocol veil).
+    /// Both server and client must use the same value. Can be set via QSSH_PROTOCOL_KEY.
+    #[arg(long, env = "QSSH_PROTOCOL_KEY", hide_env_values = true)]
+    protocol_key: Option<String>,
+
     /// Verbose/debug output
     #[arg(short = 'v', long)]
     verbose: bool,
@@ -59,7 +69,14 @@ async fn main() -> Result<()> {
     let (certs, key) = qsftp::cert::load_or_generate_certs(&cert_path, &key_path)?;
     let server_config = qsftp::cert::build_server_config(certs, key)?;
 
-    qsftp::server::run_server(&listen_addrs, server_config, args.no_auth).await
+    qsftp::server::run_server_proto(
+        &listen_addrs,
+        server_config,
+        args.no_auth,
+        args.protocol,
+        args.protocol_key.as_deref(),
+    )
+    .await
 }
 
 fn dirs_or_default() -> PathBuf {
