@@ -68,6 +68,50 @@ async fn run_pass(
     Ok(BenchResult { label, up_mibps, dl_mibps, ratio })
 }
 
+/// Run a pass with parallel forced off (single stream) for comparison baseline.
+async fn run_pass_single(
+    client: &QsftpClient,
+    test_file: &PathBuf,
+    dl_file: &PathBuf,
+    remote: &str,
+    source_hash: &str,
+) -> Result<BenchResult> {
+    let compress = client.compress;
+    let file_size = tokio::fs::metadata(test_file).await?.len() as f64;
+
+    let ratio = if compress {
+        let raw_bytes = tokio::fs::read(test_file).await?;
+        let compressed = tokio::task::spawn_blocking(move || {
+            zstd::encode_all(raw_bytes.as_slice(), ZSTD_LEVEL)
+        }).await??;
+        Some(compressed.len() as f64 / file_size)
+    } else {
+        None
+    };
+
+    // Force single stream by calling the single-stream methods directly
+    let start = std::time::Instant::now();
+    let sent = client.upload_single_pub(test_file, remote).await?;
+    let up_elapsed = start.elapsed().as_secs_f64();
+    let up_mibps = sent as f64 / up_elapsed / 1024.0 / 1024.0;
+
+    let start = std::time::Instant::now();
+    let received = client.download_single_pub(remote, dl_file).await?;
+    let dl_elapsed = start.elapsed().as_secs_f64();
+    let dl_mibps = received as f64 / dl_elapsed / 1024.0 / 1024.0;
+
+    let dl_hash = sha256_file(dl_file).await?;
+    if dl_hash != source_hash {
+        anyhow::bail!(
+            "HASH MISMATCH (single, compress={}) — DATA CORRUPTION DETECTED\n  expected: {}\n  got:      {}",
+            compress, source_hash, dl_hash
+        );
+    }
+
+    let label = if compress { "zstd single-stream" } else { "single-stream" };
+    Ok(BenchResult { label, up_mibps, dl_mibps, ratio })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -152,18 +196,36 @@ async fn main() -> Result<()> {
 
         let mut results = Vec::new();
 
-        for (label, client) in [("plain", &client_plain), ("zstd", &client_zstd)] {
-            print!("  Running {} pass... ", label);
-            let r = run_pass(client, &test_file, &dl_file, remote, &source_hash).await?;
-            println!("upload {:.1} MiB/s  download {:.1} MiB/s  integrity OK", r.up_mibps, r.dl_mibps);
-            results.push(r);
-        }
+        // single-stream baseline (plain)
+        print!("  Running single-stream (plain) pass... ");
+        let r = run_pass_single(&client_plain, &test_file, &dl_file, remote, &source_hash).await?;
+        println!("upload {:.1} MiB/s  download {:.1} MiB/s  integrity OK", r.up_mibps, r.dl_mibps);
+        results.push(r);
+
+        // parallel (plain)
+        let n_streams = qsftp::protocol::num_parallel_streams(tokio::fs::metadata(&test_file).await?.len());
+        print!("  Running parallel/{} (plain) pass... ", n_streams);
+        let r = run_pass(&client_plain, &test_file, &dl_file, remote, &source_hash).await?;
+        println!("upload {:.1} MiB/s  download {:.1} MiB/s  integrity OK", r.up_mibps, r.dl_mibps);
+        results.push(r);
+
+        // single-stream zstd
+        print!("  Running single-stream (zstd) pass... ");
+        let r = run_pass_single(&client_zstd, &test_file, &dl_file, remote, &source_hash).await?;
+        println!("upload {:.1} MiB/s  download {:.1} MiB/s  integrity OK", r.up_mibps, r.dl_mibps);
+        results.push(r);
+
+        // parallel zstd
+        print!("  Running parallel/{} (zstd) pass... ", n_streams);
+        let r = run_pass(&client_zstd, &test_file, &dl_file, remote, &source_hash).await?;
+        println!("upload {:.1} MiB/s  download {:.1} MiB/s  integrity OK", r.up_mibps, r.dl_mibps);
+        results.push(r);
 
         // Print comparison table
         println!();
         let plain = &results[0];
-        println!("  {:<22} {:>12} {:>12} {:>14} {:>8}", "Mode", "Upload", "Download", "Wire ratio", "Speedup");
-        println!("  {}", "-".repeat(76));
+        println!("  {:<26} {:>12} {:>12} {:>14} {:>8}", "Mode", "Upload", "Download", "Wire ratio", "Speedup");
+        println!("  {}", "-".repeat(80));
         for r in &results {
             let ratio_str = match r.ratio {
                 Some(ratio) => format!("{:.2}%", ratio * 100.0),
@@ -171,13 +233,13 @@ async fn main() -> Result<()> {
             };
             let speedup_up = format!("{:.1}x", r.up_mibps / plain.up_mibps);
             let speedup_dl = format!("{:.1}x", r.dl_mibps / plain.dl_mibps);
-            let speedup_str = if r.ratio.is_none() {
+            let speedup_str = if std::ptr::eq(r, plain) {
                 "baseline".to_string()
             } else {
                 format!("up {}  dl {}", speedup_up, speedup_dl)
             };
             println!(
-                "  {:<22} {:>9.1} MiB/s {:>9.1} MiB/s {:>14} {:>16}",
+                "  {:<26} {:>9.1} MiB/s {:>9.1} MiB/s {:>14} {:>16}",
                 r.label, r.up_mibps, r.dl_mibps, ratio_str, speedup_str
             );
         }

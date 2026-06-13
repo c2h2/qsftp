@@ -313,6 +313,8 @@ async fn handle_command(
             let caps = crate::protocol::ServerCaps {
                 zstd: true,
                 version: env!("GIT_VERSION").to_string(),
+                parallel_get: true,
+                parallel_put: true,
             };
             write_msg(&mut send, &Response::CapsOk { caps }).await?;
         }
@@ -535,6 +537,108 @@ async fn handle_command(
             set_permissions(&resolved, mode).await?;
 
             // Send confirmation on the command stream
+            write_msg(&mut send, &Response::Ok).await?;
+        }
+        Request::GetParallel { path, compress, num_streams } => {
+            let resolved = {
+                let sess = session.lock().await;
+                resolve_path(&sess.cwd, &path)
+            };
+            match tokio::fs::metadata(&resolved).await {
+                Ok(meta) => {
+                    let size = meta.len();
+                    write_msg(&mut send, &Response::FileDataParallel { size, compress, num_streams }).await?;
+
+                    // Divide file into `num_streams` byte ranges and send each on its own uni-stream
+                    let n = num_streams as u64;
+                    let base = size / n;
+                    let mut handles = Vec::new();
+                    for i in 0..n {
+                        let offset = i * base;
+                        let length = if i == n - 1 { size - offset } else { base };
+                        let conn2 = connection.clone();
+                        let path2 = resolved.clone();
+                        let idx = i as u8;
+                        handles.push(tokio::spawn(async move {
+                            use tokio::io::AsyncSeekExt;
+                            let mut uni = conn2.open_uni().await?;
+                            // Header: stream_index(u8) + offset(u64) + length(u64)
+                            uni.write_all(&[idx]).await?;
+                            uni.write_all(&offset.to_le_bytes()).await?;
+                            uni.write_all(&length.to_le_bytes()).await?;
+
+                            let mut file = tokio::fs::File::open(&path2).await?;
+                            file.seek(std::io::SeekFrom::Start(offset)).await?;
+                            let limited = tokio::io::AsyncReadExt::take(file, length);
+                            let chunk = crate::protocol::dynamic_chunk_size(length);
+                            if compress {
+                                let (_, _, mut uni) = crate::protocol::pipe_chunks_compress(limited, uni, chunk, 8).await?;
+                                uni.finish()?;
+                            } else {
+                                let (_, mut uni) = crate::protocol::pipe_chunks(limited, uni, chunk, 8).await?;
+                                uni.finish()?;
+                            }
+                            Ok::<(), anyhow::Error>(())
+                        }));
+                    }
+                    for h in handles { h.await??; }
+                }
+                Err(e) => {
+                    write_msg(&mut send, &Response::Error { message: e.to_string() }).await?;
+                }
+            }
+        }
+        Request::PutParallel { path, size, mode, compress, num_streams } => {
+            let resolved = {
+                let sess = session.lock().await;
+                resolve_path(&sess.cwd, &path)
+            };
+            if let Some(parent) = resolved.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+
+            // Pre-allocate the file so concurrent range writers don't race on file growth
+            {
+                let f = tokio::fs::OpenOptions::new()
+                    .write(true).create(true).truncate(true)
+                    .open(&resolved).await?;
+                f.set_len(size).await?;
+            }
+
+            write_msg(&mut send, &Response::OkParallel { num_streams }).await?;
+
+            // Accept `num_streams` uni-streams, each carrying a byte range
+            let n = num_streams as usize;
+            let mut handles = Vec::new();
+            for _ in 0..n {
+                let uni_recv = connection.accept_uni().await?;
+                let path2 = resolved.clone();
+                handles.push(tokio::spawn(async move {
+                    let mut r = uni_recv;
+                    let mut idx_buf = [0u8; 1];
+                    r.read_exact(&mut idx_buf).await?;
+                    let mut off_buf = [0u8; 8];
+                    r.read_exact(&mut off_buf).await?;
+                    let offset = u64::from_le_bytes(off_buf);
+                    let mut len_buf = [0u8; 8];
+                    r.read_exact(&mut len_buf).await?;
+                    let length = u64::from_le_bytes(len_buf);
+
+                    let chunk = crate::protocol::dynamic_chunk_size(length);
+                    // Write the received bytes directly at the correct file offset
+                    let file = tokio::fs::OpenOptions::new().write(true).open(&path2).await?;
+                    let writer = crate::protocol::OffsetWriter::new(file, offset);
+                    if compress {
+                        crate::protocol::pipe_chunks_decompress(r, writer, 8).await?;
+                    } else {
+                        crate::protocol::pipe_chunks(r, writer, chunk, 8).await?;
+                    }
+                    Ok::<(), anyhow::Error>(())
+                }));
+            }
+            for h in handles { h.await??; }
+
+            set_permissions(&resolved, mode).await?;
             write_msg(&mut send, &Response::Ok).await?;
         }
         Request::Shell { term, cols, rows } => {

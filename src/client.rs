@@ -17,6 +17,10 @@ pub struct QsftpClient {
     pub server_version: String,
     /// True if the server responded to the Caps request (i.e. is not an old server)
     pub caps_negotiated: bool,
+    /// Server supports parallel multi-stream downloads
+    pub parallel_get: bool,
+    /// Server supports parallel multi-stream uploads
+    pub parallel_put: bool,
 }
 
 /// Extract TLS info from a quinn connection.
@@ -119,6 +123,8 @@ impl QsftpClient {
                     tls_cipher,
                     server_version: caps.version,
                     caps_negotiated,
+                    parallel_get: caps.parallel_get,
+                    parallel_put: caps.parallel_put,
                 })
             }
             Response::Error { message } => {
@@ -178,6 +184,8 @@ impl QsftpClient {
                             tls_cipher,
                             server_version: caps.version,
                             caps_negotiated,
+                            parallel_get: caps.parallel_get,
+                            parallel_put: caps.parallel_put,
                         })
                     }
                     Response::Error { message } => {
@@ -204,6 +212,24 @@ impl QsftpClient {
     }
 
     pub async fn download(&self, remote_path: &str, local_path: &Path) -> Result<u64> {
+        let size = self.remote_file_size(remote_path).await?;
+        let n = crate::protocol::num_parallel_streams(size);
+        if self.parallel_get && n > 1 {
+            self.download_parallel(remote_path, local_path, n).await
+        } else {
+            self.download_single(remote_path, local_path).await
+        }
+    }
+
+    async fn remote_file_size(&self, remote_path: &str) -> Result<u64> {
+        let resp = self.command(&Request::Stat { path: remote_path.to_string() }).await?;
+        match resp {
+            Response::FileStat { stat } => Ok(stat.size),
+            _ => Ok(0),
+        }
+    }
+
+    async fn download_single(&self, remote_path: &str, local_path: &Path) -> Result<u64> {
         let compress = self.compress;
         let (mut send, mut recv) = self.connection.open_bi().await?;
         let req = Request::Get {
@@ -216,7 +242,6 @@ impl QsftpClient {
         let resp: Response = read_msg(&mut recv).await?;
         match resp {
             Response::FileData { size, compress: use_compress } => {
-                // Receive data on uni stream with timeout
                 let uni_recv = tokio::time::timeout(
                     std::time::Duration::from_secs(30),
                     self.connection.accept_uni(),
@@ -260,7 +285,108 @@ impl QsftpClient {
         }
     }
 
+    async fn download_parallel(&self, remote_path: &str, local_path: &Path, num_streams: u8) -> Result<u64> {
+        let compress = self.compress;
+        let (mut send, mut recv) = self.connection.open_bi().await?;
+        write_msg(&mut send, &Request::GetParallel {
+            path: remote_path.to_string(),
+            compress,
+            num_streams,
+        }).await?;
+        send.finish()?;
+
+        let resp: Response = read_msg(&mut recv).await?;
+        let (size, actual_streams) = match resp {
+            Response::FileDataParallel { size, num_streams: n, .. } => (size, n),
+            Response::Error { message } => anyhow::bail!("{}", message),
+            _ => anyhow::bail!("Unexpected response to GetParallel"),
+        };
+
+        if let Some(parent) = local_path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        // Pre-create file at full size
+        {
+            let f = tokio::fs::OpenOptions::new()
+                .write(true).create(true).truncate(true)
+                .open(local_path).await?;
+            f.set_len(size).await?;
+        }
+
+        let start = std::time::Instant::now();
+        let total = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        // Accept all streams concurrently
+        let mut handles = Vec::new();
+        for _ in 0..actual_streams {
+            let uni_recv = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                self.connection.accept_uni(),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("Timed out waiting for parallel stream"))??;
+
+            let path2 = local_path.to_path_buf();
+            let total2 = total.clone();
+            handles.push(tokio::spawn(async move {
+                let mut r = uni_recv;
+                let mut idx_buf = [0u8; 1];
+                r.read_exact(&mut idx_buf).await?;
+                let mut off_buf = [0u8; 8];
+                r.read_exact(&mut off_buf).await?;
+                let offset = u64::from_le_bytes(off_buf);
+                let mut len_buf = [0u8; 8];
+                r.read_exact(&mut len_buf).await?;
+                let length = u64::from_le_bytes(len_buf);
+
+                let chunk = crate::protocol::dynamic_chunk_size(length);
+                let file = tokio::fs::OpenOptions::new().write(true).open(&path2).await?;
+                let writer = crate::protocol::OffsetWriter::new(file, offset);
+                let received = if compress {
+                    let (n, _) = crate::protocol::pipe_chunks_decompress(r, writer, 8).await?;
+                    n
+                } else {
+                    let (n, _) = crate::protocol::pipe_chunks(r, writer, chunk, 8).await?;
+                    n
+                };
+                total2.fetch_add(received, std::sync::atomic::Ordering::Relaxed);
+                Ok::<(), anyhow::Error>(())
+            }));
+        }
+
+        for h in handles { h.await??; }
+
+        let received = total.load(std::sync::atomic::Ordering::Relaxed);
+        let elapsed = start.elapsed().as_secs_f64();
+        let speed = received as f64 / elapsed / 1024.0 / 1024.0;
+        eprintln!(
+            "\r  100% {} transferred in {:.1}s ({:.1} MiB/s) [{}s]       ",
+            format_size(received), elapsed, speed, actual_streams
+        );
+        Ok(received)
+    }
+
     pub async fn upload(&self, local_path: &Path, remote_path: &str) -> Result<u64> {
+        let size = tokio::fs::metadata(local_path).await?.len();
+        let n = crate::protocol::num_parallel_streams(size);
+        if self.parallel_put && n > 1 {
+            self.upload_parallel(local_path, remote_path, n).await
+        } else {
+            self.upload_single(local_path, remote_path).await
+        }
+    }
+
+    /// Public single-stream upload (bypasses parallel selection; used by bench).
+    pub async fn upload_single_pub(&self, local_path: &Path, remote_path: &str) -> Result<u64> {
+        self.upload_single(local_path, remote_path).await
+    }
+
+    /// Public single-stream download (bypasses parallel selection; used by bench).
+    pub async fn download_single_pub(&self, remote_path: &str, local_path: &Path) -> Result<u64> {
+        self.download_single(remote_path, local_path).await
+    }
+
+    async fn upload_single(&self, local_path: &Path, remote_path: &str) -> Result<u64> {
         let compress = self.compress;
         let meta = tokio::fs::metadata(local_path).await?;
         let size = meta.len();
@@ -348,6 +474,109 @@ impl QsftpClient {
                 anyhow::bail!("Unexpected response");
             }
         }
+    }
+
+    async fn upload_parallel(&self, local_path: &Path, remote_path: &str, num_streams: u8) -> Result<u64> {
+        let compress = self.compress;
+        let meta = tokio::fs::metadata(local_path).await?;
+        let size = meta.len();
+        let mode = {
+            use std::os::unix::fs::MetadataExt;
+            meta.mode()
+        };
+
+        let (mut send, mut recv) = self.connection.open_bi().await?;
+        write_msg(&mut send, &Request::PutParallel {
+            path: remote_path.to_string(),
+            size, mode, compress, num_streams,
+        }).await?;
+
+        let resp: Response = read_msg(&mut recv).await?;
+        let actual_streams = match resp {
+            Response::OkParallel { num_streams: n } => n,
+            Response::Error { message } => anyhow::bail!("{}", message),
+            _ => anyhow::bail!("Unexpected response to PutParallel"),
+        };
+
+        let start = std::time::Instant::now();
+        let total = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let total_progress = total.clone();
+
+        let progress_task = {
+            let size2 = size;
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    let done = total_progress.load(std::sync::atomic::Ordering::Relaxed);
+                    if done == u64::MAX { break; }
+                    let elapsed = start.elapsed().as_secs_f64();
+                    let speed = if elapsed > 0.0 { done as f64 / elapsed / 1024.0 / 1024.0 } else { 0.0 };
+                    let pct = if size2 > 0 { done * 100 / size2 } else { 0 };
+                    eprint!("\r  {}% {} / {} ({:.1} MiB/s) [{}s]    ",
+                        pct, format_size(done), format_size(size2), speed, actual_streams);
+                }
+            })
+        };
+
+        let n = actual_streams as u64;
+        let base = size / n;
+        let mut handles = Vec::new();
+        for i in 0..n {
+            let offset = i * base;
+            let length = if i == n - 1 { size - offset } else { base };
+            let conn2 = self.connection.clone();
+            let path2 = local_path.to_path_buf();
+            let idx = i as u8;
+            let total2 = total.clone();
+            handles.push(tokio::spawn(async move {
+                use tokio::io::AsyncSeekExt;
+                let mut uni = conn2.open_uni().await?;
+                uni.write_all(&[idx]).await?;
+                uni.write_all(&offset.to_le_bytes()).await?;
+                uni.write_all(&length.to_le_bytes()).await?;
+
+                let mut file = tokio::fs::File::open(&path2).await?;
+                file.seek(std::io::SeekFrom::Start(offset)).await?;
+                let limited = tokio::io::AsyncReadExt::take(file, length);
+                let chunk = crate::protocol::dynamic_chunk_size(length);
+                let progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let sent = if compress {
+                    let (raw, _, mut uni) = crate::protocol::pipe_chunks_compress_progress(limited, uni, chunk, 8, progress).await?;
+                    uni.finish()?;
+                    raw
+                } else {
+                    let (raw, mut uni) = crate::protocol::pipe_chunks_progress(limited, uni, chunk, 8, progress).await?;
+                    uni.finish()?;
+                    raw
+                };
+                total2.fetch_add(sent, std::sync::atomic::Ordering::Relaxed);
+                Ok::<(), anyhow::Error>(())
+            }));
+        }
+
+        for h in handles { h.await??; }
+
+        // Wait for server confirmation
+        let resp: Response = read_msg(&mut recv).await?;
+        match resp {
+            Response::Ok => {}
+            Response::Error { message } => anyhow::bail!("Upload failed: {}", message),
+            _ => anyhow::bail!("Unexpected response after parallel upload"),
+        }
+
+        let sent = total.load(std::sync::atomic::Ordering::Relaxed);
+        let elapsed = start.elapsed().as_secs_f64();
+        let speed = sent as f64 / elapsed / 1024.0 / 1024.0;
+        progress_task.abort();
+        eprintln!(
+            "\r  100% {} in {:.1}s ({:.1} MiB/s) [{}s]       ",
+            format_size(sent), elapsed, speed, actual_streams
+        );
+
+        send.finish()?;
+        Ok(sent)
     }
 }
 

@@ -36,6 +36,25 @@ pub struct ServerCaps {
     /// Server version string (e.g. "dc34306" or "1.2.3")
     #[serde(default)]
     pub version: String,
+    /// Server supports parallel multi-stream downloads (GetParallel)
+    #[serde(default)]
+    pub parallel_get: bool,
+    /// Server supports parallel multi-stream uploads (PutParallel)
+    #[serde(default)]
+    pub parallel_put: bool,
+}
+
+/// Choose how many parallel QUIC streams to use for a transfer.
+/// Files < 64 MiB: 4 streams.
+/// Files >= 64 MiB and < 128 MiB: 8 streams.
+/// Files >= 128 MiB: 16 streams.
+pub fn num_parallel_streams(file_size: u64) -> u8 {
+    const MB: u64 = 1024 * 1024;
+    match file_size {
+        s if s <  64 * MB =>  4,
+        s if s < 128 * MB =>  8,
+        _                 => 16,
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -55,6 +74,10 @@ pub enum Request {
     Chmod { path: String, mode: u32 },
     Get { path: String, compress: bool },
     Put { path: String, size: u64, mode: u32, compress: bool },
+    /// Parallel multi-stream download: server sends file over `num_streams` uni-streams
+    GetParallel { path: String, compress: bool, num_streams: u8 },
+    /// Parallel multi-stream upload: client sends file over `num_streams` uni-streams
+    PutParallel { path: String, size: u64, mode: u32, compress: bool, num_streams: u8 },
     Pwd,
     Cd { path: String },
     /// Open an interactive shell session (PTY)
@@ -103,6 +126,10 @@ pub enum Response {
     FileStat { stat: FileStat },
     Pwd { path: String },
     FileData { size: u64, compress: bool },
+    /// Parallel download ready: server will open `num_streams` uni-streams
+    FileDataParallel { size: u64, compress: bool, num_streams: u8 },
+    /// Parallel upload ready: client should open `num_streams` uni-streams
+    OkParallel { num_streams: u8 },
     /// Response to Caps query
     CapsOk { caps: ServerCaps },
     /// Shell/exec session opened; data flows on the same bi-stream after this
@@ -159,6 +186,60 @@ pub async fn read_msg<R: AsyncReadExt + Unpin, T: for<'de> Deserialize<'de>>(
 
 /// zstd compression level: 3 is the default sweet spot (fast, decent ratio).
 pub const ZSTD_LEVEL: i32 = 3;
+
+/// An `AsyncWrite` adapter that writes to a `tokio::fs::File` starting at a
+/// given byte offset, using `pwrite` so multiple `OffsetWriter`s on the same
+/// file can run concurrently without interfering.
+pub struct OffsetWriter {
+    file: tokio::fs::File,
+    offset: u64,
+}
+
+impl OffsetWriter {
+    pub fn new(file: tokio::fs::File, offset: u64) -> Self {
+        Self { file, offset }
+    }
+}
+
+impl tokio::io::AsyncWrite for OffsetWriter {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        use std::os::unix::io::AsRawFd;
+        let fd = self.file.as_raw_fd();
+        let offset = self.offset as libc::off_t;
+        let n = unsafe {
+            libc::pwrite(
+                fd,
+                buf.as_ptr() as *const libc::c_void,
+                buf.len(),
+                offset,
+            )
+        };
+        if n < 0 {
+            std::task::Poll::Ready(Err(std::io::Error::last_os_error()))
+        } else {
+            self.offset += n as u64;
+            std::task::Poll::Ready(Ok(n as usize))
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
 
 /// Pipelined chunk transfer: reader and writer run concurrently with a
 /// bounded channel between them so disk I/O and network I/O overlap.
