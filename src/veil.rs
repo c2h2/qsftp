@@ -45,6 +45,10 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How many DATA frames may be in flight (unacked) per connection before
 /// `write_all` blocks. Bounds memory and gives basic congestion control.
 const SEND_WINDOW: usize = 256;
+/// zstd level for per-frame stream compression. Frames are small (≤1100 B) and
+/// latency-sensitive, so level 1 (fast) is the right trade-off; incompressible
+/// frames are sent raw via the per-frame flag, so the cost is just a cheap probe.
+const VEIL_ZSTD_LEVEL: i32 = 1;
 
 // ── Crypto ────────────────────────────────────────────────────────────────────
 
@@ -124,12 +128,32 @@ fn fr_open(sid: u64, bidi: bool) -> Vec<u8> {
     v.push(if bidi { 1 } else { 0 });
     v
 }
-fn fr_data(sid: u64, seq: u64, bytes: &[u8]) -> Vec<u8> {
-    let mut v = vec![F_DATA];
+/// DATA frame flags (the `flag` byte after `seq`).
+const DF_COMPRESSED: u8 = 0x01;
+
+/// Build a DATA frame. When `compress` is set we zstd the payload but keep it
+/// only if it actually got smaller — tunnels often carry already-encrypted
+/// (incompressible) bytes, so we never let compression expand a frame. The
+/// per-frame flag tells the receiver whether to decompress.
+///
+/// Format: `[F_DATA][sid:8][seq:8][flag:1][len:2][payload]` where `len` is the
+/// length of `payload` as it appears on the wire (compressed or raw).
+fn fr_data(sid: u64, seq: u64, bytes: &[u8], compress: bool) -> Vec<u8> {
+    let (flag, payload): (u8, std::borrow::Cow<[u8]>) = if compress && !bytes.is_empty() {
+        match zstd::encode_all(bytes, VEIL_ZSTD_LEVEL) {
+            Ok(c) if c.len() < bytes.len() => (DF_COMPRESSED, std::borrow::Cow::Owned(c)),
+            _ => (0, std::borrow::Cow::Borrowed(bytes)),
+        }
+    } else {
+        (0, std::borrow::Cow::Borrowed(bytes))
+    };
+    let mut v = Vec::with_capacity(20 + payload.len());
+    v.push(F_DATA);
     v.extend_from_slice(&sid.to_be_bytes());
     v.extend_from_slice(&seq.to_be_bytes());
-    v.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
-    v.extend_from_slice(bytes);
+    v.push(flag);
+    v.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    v.extend_from_slice(&payload);
     v
 }
 fn fr_ack(sid: u64, ack: u64) -> Vec<u8> {
@@ -490,7 +514,9 @@ enum Cmd {
 struct InFlight {
     sid: u64,
     seq: u64,
-    bytes: Bytes,
+    /// The fully-built DATA frame body (header + possibly-compressed payload),
+    /// built once so retransmits don't recompress. Encrypted fresh each send.
+    frame: Vec<u8>,
     last_sent: Instant,
     /// Notified once this seq is acked, releasing the writer's window slot.
     accepted: Option<oneshot::Sender<()>>,
@@ -549,7 +575,8 @@ pub async fn connect(server: SocketAddr, key: VeilKey) -> Result<VeilConnection>
         Sender::Connected(sock),
         key,
         server,
-        true,
+        true,  // is_client
+        true,  // compress: zstd per-frame, on by default
         dgram_rx,
     ))
 }
@@ -604,7 +631,8 @@ async fn server_loop(
                         Sender::Shared { sock: sock.clone(), peer: from },
                         key.clone(),
                         from,
-                        false,
+                        false, // is_client
+                        true,  // compress
                         dgram_rx,
                     );
                     if accept_tx.send(conn).await.is_err() {
@@ -625,7 +653,8 @@ async fn server_loop(
             },
             key.clone(),
             from,
-            false,
+            false, // is_client
+            true,  // compress
             dgram_rx,
         );
         if accept_tx.send(conn).await.is_err() {
@@ -661,6 +690,7 @@ fn spawn_driver(
     key: VeilKey,
     peer: SocketAddr,
     is_client: bool,
+    compress: bool,
     mut dgram_rx: mpsc::Receiver<Vec<u8>>,
 ) -> VeilConnection {
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<Cmd>(SEND_WINDOW + 16);
@@ -721,11 +751,12 @@ fn spawn_driver(
                             }
                         }
                         Some(Cmd::Send { sid, seq, bytes, accepted }) => {
-                            // Window check: block by holding the oneshot until a slot frees.
-                            let dg = key.seal(&fr_data(sid, seq, &bytes));
-                            sender.send(&dg).await;
+                            // Build the DATA frame once (zstd per-frame when enabled,
+                            // kept only if it shrinks); reused verbatim on retransmit.
+                            let frame = fr_data(sid, seq, &bytes, compress);
+                            sender.send(&key.seal(&frame)).await;
                             inflight.push(InFlight {
-                                sid, seq, bytes,
+                                sid, seq, frame,
                                 last_sent: Instant::now(),
                                 accepted: Some(accepted),
                             });
@@ -785,12 +816,22 @@ fn spawn_driver(
                                 }).await;
                             }
                         }
-                        F_DATA if frame.len() >= 19 => {
+                        // [F_DATA][sid:8][seq:8][flag:1][len:2][payload]
+                        F_DATA if frame.len() >= 20 => {
                             let sid = be64(&frame[1..9]);
                             let seq = be64(&frame[9..17]);
-                            let len = u16::from_be_bytes([frame[17], frame[18]]) as usize;
-                            if frame.len() < 19 + len { continue; }
-                            let payload = Bytes::copy_from_slice(&frame[19..19+len]);
+                            let flag = frame[17];
+                            let len = u16::from_be_bytes([frame[18], frame[19]]) as usize;
+                            if frame.len() < 20 + len { continue; }
+                            let raw = &frame[20..20 + len];
+                            let payload = if flag & DF_COMPRESSED != 0 {
+                                match zstd::decode_all(raw) {
+                                    Ok(d) => Bytes::from(d),
+                                    Err(_) => continue, // corrupt frame; let retransmit recover
+                                }
+                            } else {
+                                Bytes::copy_from_slice(raw)
+                            };
                             if let Some(rs) = rx_streams.get_mut(&sid) {
                                 if seq >= rs.next_expected {
                                     rs.buffered.insert(seq, payload);
@@ -843,7 +884,8 @@ fn spawn_driver(
                     let now = Instant::now();
                     for f in inflight.iter_mut() {
                         if now.duration_since(f.last_sent) >= RTO {
-                            sender.send(&key.seal(&fr_data(f.sid, f.seq, &f.bytes))).await;
+                            // Reuse the frame built at first send (no recompression).
+                            sender.send(&key.seal(&f.frame)).await;
                             f.last_sent = now;
                         }
                     }
@@ -993,6 +1035,55 @@ mod tests {
         writer.await.unwrap();
         assert_eq!(got.len(), payload.len());
         assert_eq!(got, payload);
+    }
+
+    #[tokio::test]
+    async fn compressible_data_roundtrips() {
+        // Highly compressible payload (1 MiB of a repeating pattern) must arrive
+        // byte-identical through the zstd-on-by-default DATA path.
+        let addr = echo_server().await;
+        let conn = connect(addr, key()).await.unwrap();
+        let (mut s, mut r) = conn.open_bi().await.unwrap();
+        let payload: Vec<u8> = std::iter::repeat(b"the quick brown fox jumps. ")
+            .take(40000)
+            .flatten()
+            .copied()
+            .collect();
+        let p2 = payload.clone();
+        let writer = tokio::spawn(async move {
+            s.write_all(&p2).await.unwrap();
+            let _ = s.finish();
+        });
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; 16384];
+        while got.len() < payload.len() {
+            match r.read(&mut buf).await.unwrap() {
+                Some(n) => got.extend_from_slice(&buf[..n]),
+                None => break,
+            }
+        }
+        writer.await.unwrap();
+        assert_eq!(got, payload, "compressible data must round-trip exactly");
+    }
+
+    #[test]
+    fn frame_compression_flag() {
+        // Compressible payload → frame carries DF_COMPRESSED and is smaller.
+        let text = vec![b'a'; 1000];
+        let f = fr_data(7, 3, &text, true);
+        assert_eq!(f[17] & DF_COMPRESSED, DF_COMPRESSED, "should be flagged compressed");
+        assert!(f.len() < 20 + text.len(), "compressed frame should be smaller");
+
+        // Incompressible payload (random) → stored raw, flag clear, no expansion.
+        let mut rnd = vec![0u8; 1000];
+        rand_fill(&mut rnd);
+        let f2 = fr_data(7, 4, &rnd, true);
+        assert_eq!(f2[17] & DF_COMPRESSED, 0, "random data should be sent raw");
+        assert_eq!(f2.len(), 20 + rnd.len(), "raw frame must not expand");
+
+        // compress=false → always raw.
+        let f3 = fr_data(7, 5, &text, false);
+        assert_eq!(f3[17] & DF_COMPRESSED, 0);
     }
 
     #[tokio::test]

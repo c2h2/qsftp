@@ -252,6 +252,10 @@ trades a little throughput for being unfilterable. The passphrase is also the
 only thing that lets the server accept your packets — a wrong key is silently
 dropped, so the listener is invisible to anyone without it.
 
+VEIL compresses stream data with zstd by default (per-frame, fast level 1, and
+only kept when it actually shrinks — already-encrypted payloads like HTTPS are
+sent raw, never expanded). This is transparent and applies to all VEIL traffic.
+
 ## Resilient tunnels
 
 The [`qtunnel`](qtunnel) helper keeps a `qssh -N` forward alive across drops,
