@@ -79,6 +79,22 @@ pub async fn run_server(
     Ok(())
 }
 
+/// Send a final auth-rejection error and make sure it is actually delivered
+/// before the stream/connection is dropped.
+///
+/// `write_msg` only queues bytes into the QUIC send buffer; if we `return`
+/// straight after, dropping the `SendStream` resets it and the buffered error
+/// is discarded — the client then sees "connection lost" instead of the real
+/// reason. Calling `finish()` + `stopped()` flushes the data and waits for the
+/// peer to acknowledge the FIN, so the message always reaches the client.
+async fn deny_auth(mut send: quinn::SendStream, message: &str) -> Result<()> {
+    write_msg(&mut send, &Response::Error { message: message.to_string() }).await?;
+    // Best-effort: finish the stream and wait for the client to read it.
+    let _ = send.finish();
+    let _ = send.stopped().await;
+    Ok(())
+}
+
 async fn handle_connection(incoming: quinn::Incoming, no_auth: bool) -> Result<()> {
     let connection = incoming.await?;
     let remote = connection.remote_address();
@@ -176,14 +192,12 @@ async fn handle_connection(incoming: quinn::Incoming, no_auth: bool) -> Result<(
                                 }
                             }
                             _ => {
-                                write_msg(&mut send, &Response::Error { message: "Signature verification failed".into() }).await?;
-                                return Ok(());
+                                return deny_auth(send, "Signature verification failed").await;
                             }
                         }
                     }
                     _ => {
-                        write_msg(&mut send, &Response::Error { message: "Expected AuthPubKeySign".into() }).await?;
-                        return Ok(());
+                        return deny_auth(send, "Expected AuthPubKeySign").await;
                     }
                 }
             } else {
@@ -195,9 +209,8 @@ async fn handle_connection(incoming: quinn::Incoming, no_auth: bool) -> Result<(
                 }).await??;
 
                 if !key_found {
-                    write_msg(&mut send, &Response::Error { message: "Public key not authorized".into() }).await?;
                     warn!("Key not in authorized_keys for user '{}' from {}", username, remote);
-                    return Ok(());
+                    return deny_auth(send, "Public key not authorized").await;
                 }
 
                 let challenge = crate::ssh_auth::generate_challenge();
@@ -218,25 +231,19 @@ async fn handle_connection(incoming: quinn::Incoming, no_auth: bool) -> Result<(
                                 info
                             }
                             _ => {
-                                write_msg(&mut send, &Response::Error { message: "Signature verification failed".into() }).await?;
                                 warn!("Signature verification failed for user '{}' from {}", username, remote);
-                                return Ok(());
+                                return deny_auth(send, "Signature verification failed").await;
                             }
                         }
                     }
                     _ => {
-                        write_msg(&mut send, &Response::Error { message: "Expected AuthPubKeySign".into() }).await?;
-                        return Ok(());
+                        return deny_auth(send, "Expected AuthPubKeySign").await;
                     }
                 }
             }
         }
         _ => {
-            let resp = Response::Error {
-                message: "Must authenticate first".to_string(),
-            };
-            write_msg(&mut send, &resp).await?;
-            return Ok(());
+            return deny_auth(send, "Must authenticate first").await;
         }
     };
 

@@ -71,9 +71,14 @@ pub fn build_server_config(
     transport.stream_receive_window(4_194_304u32.into());  // 4 MiB per stream
     transport.receive_window(8_388_608u32.into());         // 8 MiB per connection
     transport.send_window(4_194_304u64);                   // 4 MiB send window
+    // Keep-alives every 5s reset the idle timer, so a live (even if idle)
+    // connection never times out. The 30s idle timeout is therefore only hit
+    // when the path is actually dead (server killed, network drop) — at which
+    // point the connection closes and a forward-only client (qssh -N) exits so
+    // a supervisor like `qtunnel` can reconnect promptly.
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
     transport.max_idle_timeout(Some(
-        std::time::Duration::from_secs(300).try_into().expect("idle timeout"),
+        std::time::Duration::from_secs(30).try_into().expect("idle timeout"),
     ));
 
     let quic_server_config = quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)?;
@@ -148,9 +153,14 @@ pub fn build_client_config() -> Result<quinn::ClientConfig> {
     transport.stream_receive_window(4_194_304u32.into());  // 4 MiB per stream
     transport.receive_window(8_388_608u32.into());         // 8 MiB per connection
     transport.send_window(4_194_304u64);                   // 4 MiB send window
+    // Keep-alives every 5s reset the idle timer, so a live (even if idle)
+    // connection never times out. The 30s idle timeout is therefore only hit
+    // when the path is actually dead (server killed, network drop) — at which
+    // point the connection closes and a forward-only client (qssh -N) exits so
+    // a supervisor like `qtunnel` can reconnect promptly.
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
     transport.max_idle_timeout(Some(
-        std::time::Duration::from_secs(300).try_into().expect("idle timeout"),
+        std::time::Duration::from_secs(30).try_into().expect("idle timeout"),
     ));
 
     let mut client_config = quinn::ClientConfig::new(Arc::new(

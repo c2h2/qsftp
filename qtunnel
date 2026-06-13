@@ -1,0 +1,65 @@
+#!/bin/sh
+# qtunnel — keep a `qssh -N` port forward alive across disconnects.
+#
+# An autossh-style wrapper: it runs `qssh -N <your args>` and automatically
+# restarts it whenever it exits (network drop, server restart, etc.), with a
+# short backoff. All arguments are passed straight through to `qssh`, so any
+# qssh flag works (-p, -i, -L, -R, user@host, ...).
+#
+# Examples:
+#   # Local 1188 -> remote SOCKS proxy on its localhost:1180, auto-reconnecting
+#   qtunnel -p 10022 -L 1188:localhost:1180 user@host
+#
+#   # Multiple forwards
+#   qtunnel -p 10022 -L 3078:localhost:3128 -L 2222:192.168.0.61:22 user@host
+#
+# Environment:
+#   QSSH            path to the qssh binary (default: qssh from PATH, else ./qssh)
+#   QTUNNEL_DELAY   seconds to wait between reconnect attempts (default: 3)
+#   QSSH_PASSWORD   password for non-interactive auth (passed through to qssh)
+#
+# Stop with Ctrl-C (or kill); the running qssh is terminated cleanly.
+
+set -u
+
+DELAY="${QTUNNEL_DELAY:-3}"
+
+# Locate the qssh binary.
+if [ -n "${QSSH:-}" ]; then
+    :
+elif command -v qssh >/dev/null 2>&1; then
+    QSSH="qssh"
+elif [ -x "$(dirname "$0")/qssh" ]; then
+    QSSH="$(dirname "$0")/qssh"
+elif [ -x "$(dirname "$0")/target/release/qssh" ]; then
+    QSSH="$(dirname "$0")/target/release/qssh"
+else
+    echo "qtunnel: cannot find 'qssh' (set QSSH=/path/to/qssh)" >&2
+    exit 127
+fi
+
+if [ "$#" -eq 0 ]; then
+    echo "usage: qtunnel [qssh args...] [user@]host" >&2
+    echo "   e.g. qtunnel -p 10022 -L 1188:localhost:1180 user@host" >&2
+    exit 2
+fi
+
+child=""
+# Forward termination signals to the child and exit.
+trap 'echo "qtunnel: stopping"; [ -n "$child" ] && kill "$child" 2>/dev/null; exit 0' INT TERM
+
+echo "qtunnel: maintaining: $QSSH -N $*"
+
+while :; do
+    # -N: forward only, no shell. Pass all user args through.
+    "$QSSH" -N "$@" &
+    child=$!
+    wait "$child"
+    rc=$?
+    child=""
+
+    # rc 0 typically means the session ended cleanly; still reconnect so the
+    # tunnel stays up the way autossh does.
+    echo "qtunnel: qssh exited (rc=$rc); reconnecting in ${DELAY}s..." >&2
+    sleep "$DELAY"
+done

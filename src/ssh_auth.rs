@@ -96,8 +96,7 @@ pub fn sign_challenge(private_key: &PrivateKey, challenge: &[u8]) -> Result<Vec<
             use rsa::signature::SignatureEncoding;
             use sha2::Sha256;
 
-            let private_key_rsa = rsa::RsaPrivateKey::try_from(kp)
-                .map_err(|e| anyhow::anyhow!("RSA key conversion: {}", e))?;
+            let private_key_rsa = rsa_private_from_ssh(kp)?;
             let signing_key = RsaSigningKey::<Sha256>::new(private_key_rsa);
             let sig = signing_key.sign(challenge);
             Ok(sig.to_vec())
@@ -106,6 +105,38 @@ pub fn sign_challenge(private_key: &PrivateKey, challenge: &[u8]) -> Result<Vec<
             anyhow::bail!("Unsupported key type for signing. Use ed25519 or RSA.");
         }
     }
+}
+
+/// Build an `rsa::RsaPrivateKey` from an `ssh-key` RSA keypair.
+///
+/// `rsa::RsaPrivateKey::try_from(&RsaKeypair)` from ssh-key 0.6 / rsa 0.9 fails
+/// with a "cryptographic error" on some keys whose Mpint components carry a
+/// leading zero byte (which makes the modulus appear one byte too long).
+/// Constructing from raw big-endian components via `BigUint::from_bytes_be`
+/// strips that padding and works reliably.
+fn rsa_private_from_ssh(kp: &ssh_key::private::RsaKeypair) -> Result<rsa::RsaPrivateKey> {
+    use rsa::BigUint;
+    let n = BigUint::from_bytes_be(kp.public.n.as_bytes());
+    let e = BigUint::from_bytes_be(kp.public.e.as_bytes());
+    let d = BigUint::from_bytes_be(kp.private.d.as_bytes());
+    let p = BigUint::from_bytes_be(kp.private.p.as_bytes());
+    let q = BigUint::from_bytes_be(kp.private.q.as_bytes());
+    let mut key = rsa::RsaPrivateKey::from_components(n, e, d, vec![p, q])
+        .map_err(|e| anyhow::anyhow!("RSA key construction: {}", e))?;
+    // Precompute CRT params; harmless if already present.
+    key.precompute()
+        .map_err(|e| anyhow::anyhow!("RSA precompute: {}", e))?;
+    Ok(key)
+}
+
+/// Build an `rsa::RsaPublicKey` from an `ssh-key` RSA public key, robust to
+/// leading-zero-padded Mpint components (see `rsa_private_from_ssh`).
+fn rsa_public_from_ssh(pk: &ssh_key::public::RsaPublicKey) -> Result<rsa::RsaPublicKey> {
+    use rsa::BigUint;
+    let n = BigUint::from_bytes_be(pk.n.as_bytes());
+    let e = BigUint::from_bytes_be(pk.e.as_bytes());
+    rsa::RsaPublicKey::new(n, e)
+        .map_err(|e| anyhow::anyhow!("RSA public key construction: {}", e))
 }
 
 /// Verify a challenge signature against a public key.
@@ -133,8 +164,7 @@ pub fn verify_challenge(
             use rsa::signature::Verifier as RsaVerifier;
             use sha2::Sha256;
 
-            let public_key_rsa = rsa::RsaPublicKey::try_from(rsa_pub)
-                .map_err(|e| anyhow::anyhow!("RSA key conversion: {}", e))?;
+            let public_key_rsa = rsa_public_from_ssh(rsa_pub)?;
             let verifying_key = RsaVerifyingKey::<Sha256>::new(public_key_rsa);
             let sig = rsa::pkcs1v15::Signature::try_from(signature_bytes)
                 .map_err(|e| anyhow::anyhow!("invalid RSA signature: {}", e))?;
@@ -201,4 +231,48 @@ fn dirs_ssh() -> PathBuf {
     std::env::var("HOME")
         .map(|h| PathBuf::from(h).join(".ssh"))
         .unwrap_or_else(|_| PathBuf::from("/root/.ssh"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ssh_key::private::RsaKeypair;
+    use ssh_key::Algorithm;
+
+    /// Regression test for the RSA `try_from` "cryptographic error": signing
+    /// and verifying must round-trip for an RSA key (some keys carry a
+    /// leading-zero Mpint byte that broke the old `try_from` conversion).
+    #[test]
+    fn rsa_sign_verify_roundtrip() {
+        let mut rng = rand::thread_rng();
+        let kp = RsaKeypair::random(&mut rng, 2048).expect("generate rsa keypair");
+        let priv_key = PrivateKey::new(kp.into(), "test").expect("private key");
+
+        let challenge = generate_challenge();
+        let sig = sign_challenge(&priv_key, &challenge).expect("sign");
+
+        let pub_openssh = public_key_openssh(&priv_key);
+        assert!(
+            verify_challenge(&pub_openssh, &challenge, &sig).expect("verify"),
+            "valid RSA signature must verify"
+        );
+
+        // A tampered challenge must NOT verify.
+        let mut bad = challenge.clone();
+        bad[0] ^= 0xff;
+        assert!(
+            !verify_challenge(&pub_openssh, &bad, &sig).expect("verify"),
+            "signature over a different challenge must not verify"
+        );
+    }
+
+    #[test]
+    fn ed25519_sign_verify_roundtrip() {
+        let mut rng = rand::thread_rng();
+        let priv_key = PrivateKey::random(&mut rng, Algorithm::Ed25519).expect("ed25519 key");
+        let challenge = generate_challenge();
+        let sig = sign_challenge(&priv_key, &challenge).expect("sign");
+        let pub_openssh = public_key_openssh(&priv_key);
+        assert!(verify_challenge(&pub_openssh, &challenge, &sig).expect("verify"));
+    }
 }

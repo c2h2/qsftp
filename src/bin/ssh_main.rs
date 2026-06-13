@@ -111,8 +111,19 @@ async fn main() -> Result<()> {
     }
 
     if args.no_shell {
-        // Just keep forwards alive until killed
-        forward_tasks.join_all().await;
+        // Forward-only mode (-N): keep forwards alive until the connection
+        // drops or all forward tasks finish. Exiting on connection loss lets a
+        // supervisor (e.g. the `qtunnel` wrapper) reconnect — otherwise the
+        // listeners stay bound forever against a dead QUIC connection.
+        let conn = client.connection.clone();
+        tokio::select! {
+            _ = forward_tasks.join_all() => {}
+            reason = conn.closed() => {
+                eprintln!("Connection closed: {}", reason);
+                // Non-zero exit so wrappers treat it as a drop to reconnect.
+                std::process::exit(1);
+            }
+        }
         return Ok(());
     }
 
@@ -140,22 +151,48 @@ async fn connect_and_auth(
 ) -> Result<QsftpClient> {
     let (connection, _endpoint) = QsftpClient::connect(addr, "localhost").await?;
 
-    if let Ok(private_key) = qsftp::ssh_auth::find_private_key(identity) {
-        match QsftpClient::authenticate_key(connection.clone(), user, &private_key).await {
-            Ok(client) => {
-                eprintln!("Authenticated with SSH key.");
-                return Ok(client);
+    // Try SSH key auth first. Remember why it failed so we can report it clearly
+    // if password auth is also unavailable.
+    let key_error: String = match qsftp::ssh_auth::find_private_key(identity) {
+        Ok(private_key) => {
+            match QsftpClient::authenticate_key(connection.clone(), user, &private_key).await {
+                Ok(client) => {
+                    eprintln!("Authenticated with SSH key.");
+                    return Ok(client);
+                }
+                Err(e) => {
+                    tracing::debug!("Key auth failed: {}", e);
+                    e.to_string()
+                }
             }
-            Err(e) => tracing::debug!("Key auth failed: {}", e),
         }
-    }
+        Err(e) => {
+            tracing::debug!("No usable SSH key: {}", e);
+            format!("no usable SSH key ({})", e)
+        }
+    };
 
+    // Fall back to password auth. If no password was supplied and there's no TTY
+    // to prompt on (e.g. a forward-only `qssh -N -L ...` running in the
+    // background), fail with a clear message instead of a cryptic os error.
     let pw = match password {
         Some(p) => p.clone(),
-        None => rpassword::read_password_from_tty(Some(&format!("{}@{}'s password: ", user, host)))?,
+        None => {
+            if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                anyhow::bail!(
+                    "Authentication failed: {key_error}. \
+                     No password provided and no terminal available to prompt; \
+                     supply a key with -i or set QSSH_PASSWORD."
+                );
+            }
+            rpassword::read_password_from_tty(Some(&format!("{}@{}'s password: ", user, host)))?
+        }
     };
+    // A fresh connection is needed because a rejected auth closes the previous one.
     let (conn2, _ep2) = QsftpClient::connect(addr, "localhost").await?;
-    QsftpClient::authenticate(conn2, user, &pw).await
+    QsftpClient::authenticate(conn2, user, &pw)
+        .await
+        .map_err(|e| anyhow::anyhow!("Authentication failed: {}", e))
 }
 
 // ── Interactive shell ────────────────────────────────────────────────────────

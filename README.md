@@ -158,6 +158,52 @@ qscp -r ./mydir user@host:/remote/path/
 qscp -P 2222 -i ~/.ssh/id_ed25519 file.txt user@host:
 ```
 
+### SSH-style Shell and Port Forwarding (`qssh`)
+
+`qssh` is an SSH-style client over QUIC: interactive shell, single-command exec,
+and TCP port forwarding (`-L` / `-R`).
+
+```sh
+# Interactive shell
+qssh user@host -p 1022
+
+# Run a single command
+qssh user@host -- uname -a
+
+# Local forward: listen locally, tunnel to a host:port reachable from the server
+qssh -N -L 8080:intranet.local:80 user@host
+
+# Remote forward: server listens on its port, tunnels back to a local host:port
+qssh -N -R 9000:localhost:3000 user@host
+```
+
+`-N` means "no shell" — set up the forwards and stay connected (like `ssh -N`).
+Multiple `-L`/`-R` flags are allowed. Forward spec format is `[bind:]port:host:port`.
+
+#### Tunneling a SOCKS proxy
+
+A common setup is a SOCKS proxy running on the remote server (e.g. on
+`localhost:1180`). Forward a local port to it and point your SOCKS client there:
+
+```sh
+# Local 1188 → remote's localhost:1180 (the SOCKS proxy), forward-only
+qssh -N -L 1188:localhost:1180 user@host -p 10022
+
+# Use it
+curl --socks5-hostname localhost:1188 https://example.com/
+export ALL_PROXY=socks5h://localhost:1188
+```
+
+For a resilient always-on tunnel (auto-reconnect), use the helper script
+[`qtunnel`](qtunnel) — see [Resilient tunnels](#resilient-tunnels) below.
+
+#### Non-interactive auth
+
+`qssh` tries SSH key auth first (`~/.ssh/id_ed25519`, `id_ecdsa`, then `id_rsa`,
+or `-i <key>`), falling back to a password prompt. For background/forward-only use
+with no terminal, supply a password via the `QSSH_PASSWORD` environment variable
+instead of relying on the prompt — otherwise key auth must succeed.
+
 ## Authentication
 
 Authentication is tried in this order:
@@ -178,6 +224,22 @@ sudo ufw allow 1022/udp
 # iptables
 sudo iptables -A INPUT -p udp --dport 1022 -j ACCEPT
 ```
+
+## Resilient tunnels
+
+The [`qtunnel`](qtunnel) helper keeps a `qssh -N` forward alive across drops,
+the way `autossh` wraps `ssh`. It restarts `qssh` whenever it exits.
+
+```sh
+# Local 1188 → remote SOCKS proxy on its localhost:1180, auto-reconnecting
+./qtunnel -p 10022 -L 1188:localhost:1180 user@host
+
+# Multiple forwards work too
+./qtunnel -p 10022 -L 3078:localhost:3128 -L 2222:192.168.0.61:22 user@host
+```
+
+It passes every argument straight through to `qssh`, so any `qssh` flag works.
+Use `QSSH_PASSWORD` for non-interactive password auth if you don't use keys.
 
 ## Protocol
 
