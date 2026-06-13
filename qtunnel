@@ -48,11 +48,19 @@ child=""
 # Forward termination signals to the child and exit.
 trap 'echo "qtunnel: stopping"; [ -n "$child" ] && kill "$child" 2>/dev/null; exit 0' INT TERM
 
-echo "qtunnel: maintaining: $QSSH -N $*"
+# Add -N (forward only, no shell) unless the caller already passed it.
+NFLAG="-N"
+for a in "$@"; do
+    case "$a" in
+        -N|--no-shell) NFLAG="" ;;
+    esac
+done
+
+echo "qtunnel: maintaining: $QSSH $NFLAG $*"
 
 while :; do
-    # -N: forward only, no shell. Pass all user args through.
-    "$QSSH" -N "$@" &
+    # Pass all user args through; add -N only if not already present.
+    "$QSSH" $NFLAG "$@" &
     child=$!
     wait "$child"
     rc=$?

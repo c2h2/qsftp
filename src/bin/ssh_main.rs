@@ -38,8 +38,9 @@ struct Args {
     #[arg(short = 'R', long, value_name = "[bind:]rport:lhost:lport")]
     remote_forward: Vec<String>,
 
-    /// Do not execute a shell or command (useful with -L/-R only)
-    #[arg(short = 'N', long)]
+    /// Do not execute a shell or command (useful with -L/-R only).
+    /// SetTrue so a wrapper (e.g. qtunnel) that also adds -N doesn't error.
+    #[arg(short = 'N', long, action = clap::ArgAction::SetTrue)]
     no_shell: bool,
 
     /// Wire transport: "quic" (default) or "veil" (obfuscated UDP that's
