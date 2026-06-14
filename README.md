@@ -195,7 +195,9 @@ export ALL_PROXY=socks5h://localhost:1188
 ```
 
 For a resilient always-on tunnel (auto-reconnect), use the helper script
-[`qtunnel`](qtunnel) — see [Resilient tunnels](#resilient-tunnels) below.
+[`qtunnel`](qtunnel) — see [Resilient tunnels](#resilient-tunnels) below. For a
+complete copy-paste recipe (key generation, systemd server, client alias) see
+[Setting up a persistent SOCKS tunnel (VEIL)](#setting-up-a-persistent-socks-tunnel-veil).
 
 #### Non-interactive auth
 
@@ -271,6 +273,106 @@ the way `autossh` wraps `ssh`. It restarts `qssh` whenever it exits.
 
 It passes every argument straight through to `qssh`, so any `qssh` flag works.
 Use `QSSH_PASSWORD` for non-interactive password auth if you don't use keys.
+
+## Setting up a persistent SOCKS tunnel (VEIL)
+
+End-to-end recipe for an always-on, unfilterable SOCKS tunnel: a SOCKS proxy
+runs on the server's `localhost:1180`, and you forward your local `1188` to it
+over the obfuscated VEIL transport. Both ends share one random passphrase.
+
+> Both ends **must** use the same `--protocol` and the same `QSSH_PROTOCOL_KEY`.
+> A QUIC client against a VEIL server (or a key mismatch) is silently dropped —
+> you'll just see `timed out`, because VEIL never answers traffic it can't
+> authenticate.
+
+### 1. Generate a shared key
+
+44 random alphanumeric characters (256 bits of entropy, no shell-special chars):
+
+```sh
+LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 44; echo
+```
+
+Keep this secret — it is the only thing protecting the tunnel.
+
+### 2. Server: store the key and run qsshd under systemd
+
+Put the key in a root-only env file and load it from the unit:
+
+```sh
+# /etc/qsshd.env  (chmod 600, root only)
+printf 'QSSH_PROTOCOL_KEY=%s\n' 'PASTE_THE_KEY_HERE' | sudo tee /etc/qsshd.env >/dev/null
+sudo chmod 600 /etc/qsshd.env
+```
+
+```ini
+# /etc/systemd/system/qsshd.service
+[Unit]
+Description=qsshd - SSH/SFTP over QUIC/VEIL (UDP)
+After=network.target
+
+[Service]
+Type=simple
+User=jump
+EnvironmentFile=/etc/qsshd.env
+ExecStart=/usr/local/bin/qsshd --protocol veil --listen 0.0.0.0:1022
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now qsshd
+sudo systemctl status qsshd          # should be "active (running)"
+sudo ufw allow 1022/udp              # VEIL is UDP, like QUIC
+```
+
+To rotate the key later: edit `/etc/qsshd.env`, then `sudo systemctl restart
+qsshd`, and update the client (step 3) with the same new value.
+
+### 3. Client: a one-line auto-reconnecting alias
+
+Point [`qtunnel`](qtunnel) at the server with the matching protocol and key.
+Add this to your shell rc (`~/.zshrc`, `~/.bashrc`, or an `alias.sh` you source):
+
+```sh
+alias otun='QSSH_PROTOCOL_KEY=PASTE_THE_KEY_HERE qtunnel --protocol veil -L 1188:localhost:1180 jump@your.host'
+```
+
+Then:
+
+```sh
+source ~/.zshrc      # reload the alias
+otun                 # connect; auto-reconnects on drops
+```
+
+`qtunnel` keeps the forward alive across network drops and server restarts. On
+success it prints `Connected to <host> (VEIL (ChaCha20-Poly1305, obfuscated UDP))`
+and binds `127.0.0.1:1188`.
+
+> Keeping the key out of your shell history/alias file: instead of inlining it,
+> store it in `~/.qsshd.env` (`chmod 600`) and source it in the alias:
+> `alias otun='source ~/.qsshd.env; qtunnel --protocol veil -L 1188:localhost:1180 jump@your.host'`
+> (where the file contains `export QSSH_PROTOCOL_KEY=...`).
+
+### 4. Use and verify the tunnel
+
+```sh
+# Route a request through the tunnel's SOCKS proxy
+curl -x socks5h://127.0.0.1:1188 https://ifconfig.me     # prints the server's exit IP
+
+# Or set it for a whole shell session
+export ALL_PROXY=socks5h://127.0.0.1:1188
+```
+
+If `ifconfig.me` returns the server's public IP, the full path
+(local 1188 → VEIL → server's SOCKS on 1180 → internet) is working.
 
 ## Protocol
 
