@@ -47,6 +47,20 @@ detect_os() {
     echo "$os"
 }
 
+# Detect the C library on Linux so we pick a matching prebuilt tarball.
+# Prints "musl" on musl systems (e.g. Alpine), otherwise "gnu".
+detect_libc() {
+    # ldd --version prints "musl" on musl-based distros; on glibc it mentions
+    # "GNU libc"/"GLIBC". Fall back to checking for a musl loader.
+    if ldd --version 2>&1 | grep -qi musl; then
+        echo "musl"
+    elif [ -f /lib/ld-musl-x86_64.so.1 ] || [ -f /lib/ld-musl-aarch64.so.1 ]; then
+        echo "musl"
+    else
+        echo "gnu"
+    fi
+}
+
 get_latest_version() {
     if command -v curl > /dev/null 2>&1; then
         curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | grep '"tag_name"' | sed 's/.*"tag_name": *"//;s/".*//'
@@ -88,20 +102,41 @@ main() {
     [ -z "$VERSION" ] && error "Could not determine version"
     info "Version: $VERSION"
 
-    # Build download URL
-    TARBALL="qsftp-${VERSION}-${ARCH}-${OS}.tar.gz"
-    URL="https://github.com/${REPO}/releases/download/${VERSION}/${TARBALL}"
-    info "Downloading ${URL}"
-
-    # Download and extract
+    # Build the candidate tarball name(s). Linux artifacts carry a libc suffix
+    # (gnu/musl); darwin does not. We try the libc that matches this host first,
+    # then fall back to the other variant (musl works on glibc systems too).
     TMPDIR=$(mktemp -d)
     trap 'rm -rf "$TMPDIR"' EXIT
 
-    download "$URL" "${TMPDIR}/${TARBALL}"
+    if [ "$OS" = "linux" ]; then
+        LIBC=$(detect_libc)
+        info "libc: ${LIBC}"
+        if [ "$LIBC" = "musl" ]; then
+            CANDIDATES="qsftp-${VERSION}-${ARCH}-${OS}-musl.tar.gz qsftp-${VERSION}-${ARCH}-${OS}-gnu.tar.gz"
+        else
+            CANDIDATES="qsftp-${VERSION}-${ARCH}-${OS}-gnu.tar.gz qsftp-${VERSION}-${ARCH}-${OS}-musl.tar.gz"
+        fi
+    else
+        CANDIDATES="qsftp-${VERSION}-${ARCH}-${OS}.tar.gz"
+    fi
+
+    TARBALL=""
+    for cand in $CANDIDATES; do
+        URL="https://github.com/${REPO}/releases/download/${VERSION}/${cand}"
+        info "Downloading ${URL}"
+        if download "$URL" "${TMPDIR}/${cand}" && [ -s "${TMPDIR}/${cand}" ]; then
+            TARBALL="$cand"
+            break
+        fi
+        warn "Not available: ${cand}"
+        rm -f "${TMPDIR}/${cand}"
+    done
+    [ -z "$TARBALL" ] && error "No release tarball found for ${ARCH}-${OS}"
+
     tar -xzf "${TMPDIR}/${TARBALL}" -C "$TMPDIR"
 
     # Install binaries
-    BINARIES="qsshd qsftp qscp qssh"
+    BINARIES="qsshd qsftp qscp qssh qtunnel"
     info "Installing to ${INSTALL_DIR}/"
 
     if [ -w "$INSTALL_DIR" ]; then
